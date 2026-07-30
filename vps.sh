@@ -9,7 +9,9 @@ YELLOW='\033[0;33m'
 NC='\033[0m'
 LOG_FILE="/var/log/vps_init.log"
 SYSCTL_FILE="/etc/sysctl.d/99-vps-init.conf"
-VERSION="1.1.1"
+VERSION="1.1.2"
+MANAGED_SWAP_FILE="/swapfile"
+BACKUP_DIR="/var/backups/vps-init"
 
 touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/vps_init.log"
 
@@ -57,6 +59,235 @@ EOF
     else
         error "Fail2ban 端口已写入，但服务重启失败；请执行 fail2ban-client -t 检查配置。"
     fi
+}
+
+add_unique_path() {
+    local array_name="$1"
+    local value="$2"
+    local existing
+    local -n target_array="$array_name"
+
+    for existing in "${target_array[@]}"; do
+        [[ "$existing" == "$value" ]] && return 0
+    done
+    target_array+=("$value")
+}
+
+scan_sysctl_configs() {
+    local dir
+    local file
+    local real_file
+    local is_etc_file
+    local -A seen_files=()
+    local -a scan_dirs=(/etc/sysctl.d /run/sysctl.d /usr/local/lib/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d)
+
+    ALL_SYSCTL_FILES=()
+    ETC_KEY_FILES=()
+    ETC_TCP_FILES=()
+    READONLY_TCP_FILES=()
+    LEGACY_TCP_FILES=()
+
+    for dir in "${scan_dirs[@]}"; do
+        [[ -d "$dir" ]] || continue
+        while IFS= read -r -d '' file; do
+            real_file=$(readlink -f "$file" 2>/dev/null || printf '%s' "$file")
+            [[ -n "${seen_files[$real_file]+x}" ]] && continue
+            seen_files[$real_file]=1
+            ALL_SYSCTL_FILES+=("$file")
+        done < <(find "$dir" -maxdepth 1 \( -type f -o -type l \) -name '*.conf' -print0 2>/dev/null)
+    done
+    if [[ -f /etc/sysctl.conf ]]; then
+        real_file=$(readlink -f /etc/sysctl.conf 2>/dev/null || printf '%s' /etc/sysctl.conf)
+        if [[ -z "${seen_files[$real_file]+x}" ]]; then
+            seen_files[$real_file]=1
+            ALL_SYSCTL_FILES+=(/etc/sysctl.conf)
+        fi
+    fi
+
+    for file in "${ALL_SYSCTL_FILES[@]}"; do
+        real_file=$(readlink -f "$file" 2>/dev/null || printf '%s' "$file")
+        is_etc_file=0
+        [[ "$file" == /etc/* && "$real_file" == /etc/* ]] && is_etc_file=1
+
+        if grep -qE '^[[:space:]]*(net\.ipv4\.tcp_congestion_control|net\.core\.default_qdisc)[[:space:]]*=' "$file"; then
+            if [[ "$file" == "/etc/sysctl.conf" ]]; then
+                add_unique_path LEGACY_TCP_FILES "$file"
+            elif [[ "$is_etc_file" == "1" ]]; then
+                add_unique_path ETC_KEY_FILES "$file"
+            else
+                add_unique_path READONLY_TCP_FILES "$file"
+            fi
+        fi
+
+        if grep -qE '^[[:space:]]*(net\.ipv4\.tcp_[A-Za-z0-9_]*|net\.core\.[A-Za-z0-9_]*)[[:space:]]*=' "$file"; then
+            if [[ "$file" == "/etc/sysctl.conf" ]]; then
+                add_unique_path LEGACY_TCP_FILES "$file"
+            elif [[ "$is_etc_file" == "1" ]]; then
+                add_unique_path ETC_TCP_FILES "$file"
+            else
+                add_unique_path READONLY_TCP_FILES "$file"
+            fi
+        fi
+    done
+}
+
+filter_high_priority_sysctl_files() {
+    local source_name="$1"
+    local target_name="$2"
+    local file
+    local filename
+    local -n source_array="$source_name"
+    local -n target_array="$target_name"
+
+    target_array=()
+    for file in "${source_array[@]}"; do
+        filename=$(basename "$file")
+        if [[ "$filename" > "59-" ]]; then
+            add_unique_path "$target_name" "$file"
+        fi
+    done
+}
+
+choose_path_interactively() {
+    local prompt="$1"
+    shift
+    local -a candidates=("$@")
+    local index
+    local choice
+
+    echo "$prompt"
+    for index in "${!candidates[@]}"; do
+        printf ' %d. %s\n' "$((index + 1))" "${candidates[$index]}"
+    done
+    echo " 0. 取消"
+    read -p "请选择配置文件: " choice
+    if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#candidates[@]} )); then
+        SYSCTL_TARGET=""
+        return 1
+    fi
+    SYSCTL_TARGET="${candidates[$((choice - 1))]}"
+}
+
+select_sysctl_target() {
+    local -a high_priority_key_files=()
+    local -a high_priority_tcp_files=()
+    local resolved_target
+    SYSCTL_TARGET=""
+    scan_sysctl_configs
+    filter_high_priority_sysctl_files ETC_KEY_FILES high_priority_key_files
+    filter_high_priority_sysctl_files ETC_TCP_FILES high_priority_tcp_files
+
+    if (( ${#high_priority_key_files[@]} == 1 )); then
+        SYSCTL_TARGET="${high_priority_key_files[0]}"
+    elif (( ${#high_priority_key_files[@]} > 1 )); then
+        choose_path_interactively "检测到多个高优先级 /etc 配置文件定义了 BBR 或队列参数：" "${high_priority_key_files[@]}" || return 1
+    elif (( ${#high_priority_tcp_files[@]} == 1 )); then
+        SYSCTL_TARGET="${high_priority_tcp_files[0]}"
+    elif (( ${#high_priority_tcp_files[@]} > 1 )); then
+        choose_path_interactively "检测到多个高优先级 /etc TCP 参数文件，不自动选择：" "${high_priority_tcp_files[@]}" || return 1
+    elif [[ -f "$SYSCTL_FILE" ]]; then
+        if [[ "$(readlink -f "$SYSCTL_FILE" 2>/dev/null)" == /etc/* ]]; then
+            SYSCTL_TARGET="$SYSCTL_FILE"
+        else
+            SYSCTL_TARGET="/etc/sysctl.d/99-vps-init-bbr.conf"
+            echo -e "${YELLOW}$SYSCTL_FILE 指向系统目录，不会修改；改用 $SYSCTL_TARGET。${NC}"
+        fi
+    else
+        SYSCTL_TARGET="$SYSCTL_FILE"
+        if (( ${#READONLY_TCP_FILES[@]} > 0 )); then
+            echo -e "${YELLOW}只在系统只读目录发现 TCP 配置，将使用 $SYSCTL_FILE 覆盖，不修改以下文件：${NC}"
+            printf ' - %s\n' "${READONLY_TCP_FILES[@]}"
+        else
+            log "未发现可安全复用的高优先级 /etc TCP 参数文件，将新建 $SYSCTL_FILE。"
+        fi
+    fi
+
+    if (( ${#ETC_TCP_FILES[@]} > ${#high_priority_tcp_files[@]} )); then
+        echo -e "${YELLOW}已忽略文件名优先级偏低的 /etc TCP 配置，避免在 Debian 13 启动时被后加载文件覆盖。${NC}"
+    fi
+    if (( ${#LEGACY_TCP_FILES[@]} > 0 )); then
+        echo -e "${YELLOW}检测到裸 /etc/sysctl.conf，但未发现 sysctl.d 链接，因此只检查、不作为 systemd 持久化目标。${NC}"
+    fi
+
+    if [[ -L "$SYSCTL_TARGET" ]]; then
+        resolved_target=$(readlink -f "$SYSCTL_TARGET" 2>/dev/null)
+        if [[ "$resolved_target" == /etc/* ]]; then
+            log "$SYSCTL_TARGET 是符号链接，将安全更新其实际 /etc 文件：$resolved_target"
+            SYSCTL_TARGET="$resolved_target"
+        else
+            SYSCTL_TARGET="/etc/sysctl.d/99-vps-init-bbr.conf"
+            echo -e "${YELLOW}候选文件指向系统目录，不会修改；改用 $SYSCTL_TARGET。${NC}"
+        fi
+    fi
+
+    return 0
+}
+
+write_sysctl_key() {
+    local file="$1"
+    local key="$2"
+    local value="$3"
+    local escaped_key="${key//./\\.}"
+
+    sed -i -E "\\|^[[:space:]]*${escaped_key}[[:space:]]*=|d" "$file"
+    printf '%s = %s\n' "$key" "$value" >> "$file"
+}
+
+persist_bbr_settings() {
+    local previous_cc="$1"
+    local previous_qdisc="$2"
+    local write_bbr="${3:-1}"
+    local target_existed=0
+    local backup_file=""
+    local result_label="BBR + FQ"
+
+    select_sysctl_target || {
+        error "未选择 sysctl 配置文件，已取消 BBR 配置。"
+        return 1
+    }
+
+    [[ "$write_bbr" == "0" ]] && result_label="FQ"
+
+    if ! mkdir -p "$(dirname "$SYSCTL_TARGET")" "$BACKUP_DIR"; then
+        error "无法创建 sysctl 配置或备份目录。"
+        return 1
+    fi
+    if [[ -f "$SYSCTL_TARGET" ]]; then
+        target_existed=1
+        backup_file="$BACKUP_DIR/$(basename "$SYSCTL_TARGET").$(date +%Y%m%d%H%M%S)-$$.bak"
+        if ! cp -a "$SYSCTL_TARGET" "$backup_file"; then
+            error "无法备份 $SYSCTL_TARGET，未修改配置。"
+            return 1
+        fi
+    else
+        if ! touch "$SYSCTL_TARGET"; then
+            error "无法创建 $SYSCTL_TARGET。"
+            return 1
+        fi
+    fi
+
+    if ! write_sysctl_key "$SYSCTL_TARGET" net.core.default_qdisc fq; then
+        error "写入 FQ 配置失败。"
+    elif [[ "$write_bbr" == "1" ]] && ! write_sysctl_key "$SYSCTL_TARGET" net.ipv4.tcp_congestion_control bbr; then
+        error "写入 BBR 配置失败。"
+    elif sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 && \
+         { [[ "$write_bbr" == "0" ]] || sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; } && \
+         [[ "$(sysctl -n net.core.default_qdisc 2>/dev/null)" == "fq" ]] && \
+         { [[ "$write_bbr" == "0" ]] || [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; }; then
+        log "$result_label 已生效，配置写入 $SYSCTL_TARGET。"
+        [[ -n "$backup_file" ]] && log "原配置备份：$backup_file"
+        return 0
+    fi
+
+    if [[ "$target_existed" == "1" ]]; then
+        cp -a "$backup_file" "$SYSCTL_TARGET"
+    else
+        rm -f "$SYSCTL_TARGET"
+    fi
+    [[ -n "$previous_qdisc" ]] && sysctl -w "net.core.default_qdisc=$previous_qdisc" >/dev/null 2>&1 || true
+    [[ -n "$previous_cc" ]] && sysctl -w "net.ipv4.tcp_congestion_control=$previous_cc" >/dev/null 2>&1 || true
+    error "$result_label 应用失败，配置文件和运行参数已回滚。"
+    return 1
 }
 
 if [[ $EUID -ne 0 ]]; then
@@ -152,14 +383,45 @@ submenu_swap() {
                 fi
                 ;;
             4)
-                log "正在卸载并删除当前 SWAP..."
-                swapoff -a
-                SWAP_FILE=$(awk '!/^#/ && $3=="swap" {print $1}' /etc/fstab)
-                if [[ -n "$SWAP_FILE" && -f "$SWAP_FILE" ]]; then
-                    rm -f "$SWAP_FILE"
+                SWAP_ACTIVE=0
+                SWAP_CONFIGURED=0
+                swapon --show=NAME --noheadings --raw 2>/dev/null | grep -Fxq "$MANAGED_SWAP_FILE" && SWAP_ACTIVE=1
+                awk -v path="$MANAGED_SWAP_FILE" '!/^[[:space:]]*#/ && $1==path && $3=="swap" {found=1} END {exit !found}' /etc/fstab && SWAP_CONFIGURED=1
+
+                if [[ "$SWAP_ACTIVE" == "0" && "$SWAP_CONFIGURED" == "0" ]]; then
+                    error "未检测到由脚本管理的 $MANAGED_SWAP_FILE；其他 SWAP 分区或文件不会被删除。"
+                    read -p "按回车键继续..."; continue
                 fi
-                sed -i '/^\s*[^#].*swap/d' /etc/fstab
-                log "SWAP 已彻底清理完毕。"
+
+                read -p "确认只卸载并删除 $MANAGED_SWAP_FILE 吗？其他 SWAP 将保留。[y/N]: " confirm_swap_remove
+                [[ "$confirm_swap_remove" != "y" && "$confirm_swap_remove" != "Y" ]] && continue
+
+                log "正在安全卸载并删除 $MANAGED_SWAP_FILE..."
+                if [[ "$SWAP_ACTIVE" == "1" ]] && ! swapoff "$MANAGED_SWAP_FILE"; then
+                    error "$MANAGED_SWAP_FILE 卸载失败，未修改 fstab，也未删除文件。"
+                    read -p "按回车键继续..."; continue
+                fi
+
+                mkdir -p "$BACKUP_DIR"
+                FSTAB_BACKUP="$BACKUP_DIR/fstab.$(date +%Y%m%d%H%M%S).bak"
+                cp -a /etc/fstab "$FSTAB_BACKUP"
+                FSTAB_TMP=$(mktemp /tmp/vps-init-fstab.XXXXXX)
+                if awk -v path="$MANAGED_SWAP_FILE" '!($1==path && $3=="swap")' /etc/fstab > "$FSTAB_TMP" && cat "$FSTAB_TMP" > /etc/fstab; then
+                    rm -f "$FSTAB_TMP"
+                else
+                    rm -f "$FSTAB_TMP"
+                    cp -a "$FSTAB_BACKUP" /etc/fstab
+                    [[ "$SWAP_ACTIVE" == "1" ]] && swapon "$MANAGED_SWAP_FILE" >/dev/null 2>&1 || true
+                    error "fstab 更新失败，已恢复原配置。"
+                    read -p "按回车键继续..."; continue
+                fi
+
+                if [[ -f "$MANAGED_SWAP_FILE" ]] && ! rm -f "$MANAGED_SWAP_FILE"; then
+                    error "SWAP 已卸载且 fstab 条目已移除，但文件删除失败：$MANAGED_SWAP_FILE"
+                    read -p "按回车键继续..."; continue
+                fi
+
+                log "$MANAGED_SWAP_FILE 已安全删除；其他 SWAP 配置保持不变。fstab 备份：$FSTAB_BACKUP"
                 read -p "按回车键继续..."; continue
                 ;;
             0) return ;;
@@ -167,6 +429,10 @@ submenu_swap() {
         esac
 
         if [[ "$choice_swap" =~ ^[1-3]$ ]]; then
+            if [[ -e "$MANAGED_SWAP_FILE" ]]; then
+                error "$MANAGED_SWAP_FILE 已存在但未被识别为活动 SWAP，为避免覆盖未知文件已停止操作。"
+                read -p "按回车键继续..."; continue
+            fi
             log "正在创建 $swap_size 的 SWAP 文件..."
             
             if command -v numfmt >/dev/null 2>&1; then
@@ -177,21 +443,26 @@ submenu_swap() {
                 [[ "${unit^^}" == "G" ]] && count_val=$((num * 1024)) || count_val=$num
             fi
 
-            if ! fallocate -l "$swap_size" /swapfile 2>/dev/null; then
+            if ! fallocate -l "$swap_size" "$MANAGED_SWAP_FILE" 2>/dev/null; then
                 log "当前文件系统不支持 fallocate，正在降级使用 dd 创建 (请耐心等待)..."
-                dd if=/dev/zero of=/swapfile bs=1M count="$count_val" status=progress conv=fsync
+                dd if=/dev/zero of="$MANAGED_SWAP_FILE" bs=1M count="$count_val" status=progress conv=fsync
             fi
             
-            if [[ ! -f /swapfile ]] || [[ $(stat -c%s /swapfile) -lt 1048576 ]]; then
+            if [[ ! -f "$MANAGED_SWAP_FILE" ]] || [[ $(stat -c%s "$MANAGED_SWAP_FILE") -lt 1048576 ]]; then
                 error "SWAP 文件创建失败，磁盘空间可能不足！"
-                rm -f /swapfile
+                rm -f "$MANAGED_SWAP_FILE"
                 read -p "按回车键继续..."; continue
             fi
 
-            chmod 600 /swapfile
-            mkswap /swapfile
-            swapon /swapfile
-            grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+            chmod 600 "$MANAGED_SWAP_FILE"
+            if ! mkswap "$MANAGED_SWAP_FILE" >/dev/null || ! swapon "$MANAGED_SWAP_FILE"; then
+                error "SWAP 初始化或启用失败，正在清理未完成文件。"
+                swapoff "$MANAGED_SWAP_FILE" >/dev/null 2>&1 || true
+                rm -f "$MANAGED_SWAP_FILE"
+                read -p "按回车键继续..."; continue
+            fi
+            awk -v path="$MANAGED_SWAP_FILE" '!/^[[:space:]]*#/ && $1==path && $3=="swap" {found=1} END {exit !found}' /etc/fstab || \
+                printf '%s none swap sw 0 0 # managed by vps-init\n' "$MANAGED_SWAP_FILE" >> /etc/fstab
             
             mkdir -p /etc/sysctl.d/
             if grep -q "^vm.swappiness" "$SYSCTL_FILE" 2>/dev/null; then
@@ -527,12 +798,99 @@ show_dns_status() {
     fi
 }
 
+validate_dns_address() {
+    local address="$1"
+    local octet
+    local part
+    local part_count=0
+    local -a ipv4_octets=()
+    local -a ipv6_parts=()
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import ipaddress, sys; ipaddress.ip_address(sys.argv[1])' "$address" >/dev/null 2>&1
+        return $?
+    fi
+
+    if [[ "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        IFS='.' read -r -a ipv4_octets <<< "$address"
+        for octet in "${ipv4_octets[@]}"; do
+            (( 10#$octet <= 255 )) || return 1
+        done
+        return 0
+    fi
+
+    [[ "$address" == *:* ]] || return 1
+    [[ "$address" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+    [[ "$address" != *:::* ]] || return 1
+    [[ "$address" != :* || "$address" == ::* ]] || return 1
+    [[ "$address" != *: || "$address" == *:: ]] || return 1
+
+    if [[ "$address" == *::* ]]; then
+        [[ "${address#*::}" != *::* ]] || return 1
+    fi
+    IFS=':' read -r -a ipv6_parts <<< "$address"
+    for part in "${ipv6_parts[@]}"; do
+        [[ -z "$part" ]] && continue
+        (( ${#part} <= 4 )) || return 1
+        ((part_count++))
+    done
+
+    if [[ "$address" == *::* ]]; then
+        (( part_count < 8 ))
+    else
+        (( part_count == 8 ))
+    fi
+}
+
+backup_dns_file() {
+    local target="$1"
+    local index="${#DNS_CHANGED_FILES[@]}"
+    local backup="$DNS_BACKUP_PATH/$index-$(basename "$target")"
+    local existed=0
+
+    if [[ -e "$target" || -L "$target" ]]; then
+        existed=1
+        cp -a -- "$target" "$backup" || return 1
+    fi
+    DNS_CHANGED_FILES+=("$target")
+    DNS_BACKUP_FILES+=("$backup")
+    DNS_FILE_EXISTED+=("$existed")
+}
+
+restore_dns_files() {
+    local index
+    local target
+
+    for (( index=${#DNS_CHANGED_FILES[@]}-1; index>=0; index-- )); do
+        target="${DNS_CHANGED_FILES[$index]}"
+        [[ "$target" == "/etc/resolv.conf" ]] && chattr -i "$target" >/dev/null 2>&1 || true
+        rm -f -- "$target"
+        if [[ "${DNS_FILE_EXISTED[$index]}" == "1" ]]; then
+            mkdir -p "$(dirname "$target")"
+            cp -a -- "${DNS_BACKUP_FILES[$index]}" "$target"
+        fi
+    done
+
+    if [[ "$DNS_NETPLAN_APPLIED" == "1" ]] && command -v netplan >/dev/null 2>&1; then
+        netplan generate >/dev/null 2>&1 && netplan apply >/dev/null 2>&1 || true
+    fi
+    if [[ "$DNS_RESOLVED_ACTIVE" == "1" ]]; then
+        systemctl restart systemd-resolved >/dev/null 2>&1 || true
+    fi
+    [[ "$DNS_RESOLV_WAS_IMMUTABLE" == "1" ]] && chattr +i /etc/resolv.conf >/dev/null 2>&1 || true
+}
+
 sync_interfaces_dns() {
     local dns_line="$1"
+    local default_iface
     local file
-    local updated=0
+    local target_file=""
+    local temp_file
     local -a interface_files=()
+    local -a matches=()
 
+    default_iface=$(ip -o route show default 2>/dev/null | awk '{print $5; exit}')
+    [[ -n "$default_iface" ]] || return 0
     [[ -f /etc/network/interfaces ]] && interface_files+=(/etc/network/interfaces)
     if [[ -d /etc/network/interfaces.d ]]; then
         while IFS= read -r -d '' file; do
@@ -541,22 +899,49 @@ sync_interfaces_dns() {
     fi
 
     for file in "${interface_files[@]}"; do
-        if grep -qE '^[[:space:]]*dns-nameservers[[:space:]]+' "$file"; then
-            cp -a "$file" "${file}.vps-init.bak"
-            sed -i -E "s|^[[:space:]]*dns-nameservers[[:space:]].*|    dns-nameservers $dns_line|" "$file"
-            updated=1
-            [[ "$file" == *50-cloud-init* ]] && echo -e "${YELLOW}注意：$file 由 cloud-init 生成，云平台在后续启动时仍可能覆盖它。${NC}"
+        if grep -qE "^[[:space:]]*iface[[:space:]]+$default_iface[[:space:]]+inet[[:space:]]+" "$file"; then
+            matches+=("$file")
         fi
     done
 
-    [[ "$updated" == "1" ]] && log "已同步 interfaces 系列配置中的 dns-nameservers。"
+    if (( ${#matches[@]} > 1 )); then
+        echo -e "${YELLOW}多个 interfaces 文件定义默认网卡 $default_iface，已跳过自动修改：${NC}"
+        printf ' - %s\n' "${matches[@]}"
+        return 0
+    elif (( ${#matches[@]} == 0 )); then
+        return 0
+    fi
+
+    target_file="${matches[0]}"
+    backup_dns_file "$target_file" || return 1
+    temp_file=$(mktemp /tmp/vps-init-interfaces.XXXXXX) || return 1
+    if ! awk -v iface="$default_iface" -v dns="$dns_line" '
+        $0 ~ "^[[:space:]]*iface[[:space:]]+" iface "[[:space:]]+inet[[:space:]]+" {
+            in_target=1; wrote_dns=0; print; next
+        }
+        in_target && /^[[:space:]]*iface[[:space:]]+/ {
+            if (!wrote_dns) print "    dns-nameservers " dns
+            in_target=0
+        }
+        in_target && /^[[:space:]]*dns-nameservers[[:space:]]+/ {
+            if (!wrote_dns) print "    dns-nameservers " dns
+            wrote_dns=1; next
+        }
+        { print }
+        END { if (in_target && !wrote_dns) print "    dns-nameservers " dns }
+    ' "$target_file" > "$temp_file" || ! cat "$temp_file" > "$target_file"; then
+        rm -f "$temp_file"
+        return 1
+    fi
+    rm -f "$temp_file"
+    log "已同步 $target_file 中默认网卡 $default_iface 的 DNS。"
+    [[ "$target_file" == *50-cloud-init* ]] && echo -e "${YELLOW}注意：该文件由 cloud-init 生成，云平台后续启动时仍可能覆盖它。${NC}"
 }
 
 sync_netplan_dns() {
     local dns_csv="$1"
     local default_iface
     local override_file="/etc/netplan/99-vps-init-dns.yaml"
-    local backup_file="${override_file}.bak"
 
     command -v netplan >/dev/null 2>&1 || return 0
     [[ -d /etc/netplan ]] || return 0
@@ -567,11 +952,7 @@ sync_netplan_dns() {
         return 0
     fi
 
-    if [[ -f "$override_file" ]]; then
-        cp -a "$override_file" "$backup_file"
-    else
-        rm -f "$backup_file"
-    fi
+    backup_dns_file "$override_file" || return 1
     cat > "$override_file" <<EOF
 network:
   version: 2
@@ -580,55 +961,103 @@ network:
       nameservers:
         addresses: [$dns_csv]
 EOF
-    chmod 600 "$override_file"
+    chmod 600 "$override_file" || return 1
+    DNS_NETPLAN_APPLIED=1
+    netplan generate >/dev/null 2>&1 || return 1
+    netplan apply >/dev/null 2>&1 || return 1
+    log "已通过 netplan 为 $default_iface 同步 DNS。"
+}
 
-    if netplan generate >/dev/null 2>&1; then
-        if netplan apply; then
-            log "已通过 netplan 为 $default_iface 同步 DNS。"
-        else
-            error "netplan apply 失败，正在恢复之前的 override。"
-            if [[ -f "$backup_file" ]]; then
-                cp -a "$backup_file" "$override_file"
-            else
-                rm -f "$override_file"
-            fi
-            netplan generate >/dev/null 2>&1 && netplan apply >/dev/null 2>&1 || true
-        fi
-    else
-        error "netplan 配置校验失败，正在恢复 DNS override。"
-        if [[ -f "$backup_file" ]]; then
-            cp -a "$backup_file" "$override_file"
-        else
-            rm -f "$override_file"
-        fi
+verify_dns_change() {
+    local route_after
+
+    if [[ -n "$DNS_DEFAULT_ROUTE_BEFORE" ]]; then
+        route_after=$(ip route show default 2>/dev/null; ip -6 route show default 2>/dev/null)
+        [[ -n "$route_after" ]] || return 1
     fi
+    getent ahosts github.com >/dev/null 2>&1 || getent ahosts cloudflare.com >/dev/null 2>&1
 }
 
 apply_dns_servers() {
     local dns_line="$1"
     local dns_csv="${dns_line// /, }"
     local dns_server
+    local resolved_file="/etc/systemd/resolved.conf.d/99-vps-init-dns.conf"
 
-    sync_interfaces_dns "$dns_line"
-    sync_netplan_dns "$dns_csv"
+    for dns_server in $dns_line; do
+        if ! validate_dns_address "$dns_server"; then
+            error "无效的 DNS 地址：$dns_server"
+            return 1
+        fi
+    done
+
+    DNS_CHANGED_FILES=()
+    DNS_BACKUP_FILES=()
+    DNS_FILE_EXISTED=()
+    DNS_BACKUP_PATH="$BACKUP_DIR/dns-$(date +%Y%m%d%H%M%S)-$$"
+    DNS_DEFAULT_ROUTE_BEFORE=$(ip route show default 2>/dev/null; ip -6 route show default 2>/dev/null)
+    DNS_NETPLAN_APPLIED=0
+    DNS_RESOLVED_ACTIVE=0
+    DNS_RESOLV_WAS_IMMUTABLE=0
+    mkdir -p "$DNS_BACKUP_PATH" || return 1
+
+    if ! sync_interfaces_dns "$dns_line" || ! sync_netplan_dns "$dns_csv"; then
+        error "DNS 持久化配置写入失败，正在回滚。"
+        restore_dns_files
+        return 1
+    fi
 
     if systemctl is-active systemd-resolved >/dev/null 2>&1; then
-        mkdir -p /etc/systemd/resolved.conf.d/
-        cat > /etc/systemd/resolved.conf.d/99-vps-init-dns.conf <<EOF
+        DNS_RESOLVED_ACTIVE=1
+        mkdir -p /etc/systemd/resolved.conf.d/ || {
+            restore_dns_files
+            return 1
+        }
+        backup_dns_file "$resolved_file" || {
+            restore_dns_files
+            return 1
+        }
+        cat > "$resolved_file" <<EOF
 [Resolve]
 DNS=$dns_line
 FallbackDNS=
 EOF
-        systemctl restart systemd-resolved || return 1
+        if ! systemctl restart systemd-resolved; then
+            error "systemd-resolved 重启失败，正在回滚 DNS。"
+            restore_dns_files
+            return 1
+        fi
     else
+        backup_dns_file /etc/resolv.conf || {
+            restore_dns_files
+            return 1
+        }
+        lsattr /etc/resolv.conf 2>/dev/null | awk '{print $1}' | grep -q i && DNS_RESOLV_WAS_IMMUTABLE=1
         chattr -i /etc/resolv.conf >/dev/null 2>&1 || true
-        [[ -L /etc/resolv.conf ]] && rm -f /etc/resolv.conf
-        : > /etc/resolv.conf
+        if ! rm -f /etc/resolv.conf; then
+            restore_dns_files
+            return 1
+        fi
+        : > /etc/resolv.conf || {
+            restore_dns_files
+            return 1
+        }
         for dns_server in $dns_line; do
-            printf 'nameserver %s\n' "$dns_server" >> /etc/resolv.conf
+            printf 'nameserver %s\n' "$dns_server" >> /etc/resolv.conf || {
+                restore_dns_files
+                return 1
+            }
         done
+        [[ "$DNS_RESOLV_WAS_IMMUTABLE" == "1" ]] && chattr +i /etc/resolv.conf >/dev/null 2>&1 || true
     fi
 
+    if ! verify_dns_change; then
+        error "DNS 应用后网络或解析验证失败，正在恢复原配置。"
+        restore_dns_files
+        return 1
+    fi
+
+    log "DNS 已应用并验证成功；原文件备份保存在 $DNS_BACKUP_PATH。"
     return 0
 }
 
@@ -786,6 +1215,25 @@ submenu_net() {
 
         case "$choice_net" in
             1) 
+                CURRENT_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+                CURRENT_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+
+                if [[ "$CURRENT_CC" == "bbr" && "$CURRENT_QDISC" == "fq" ]]; then
+                    log "BBR 与 FQ 当前均已开启，不创建或修改任何 sysctl 文件。"
+                    read -p "按回车键继续..."; continue
+                fi
+
+                if [[ "$CURRENT_CC" == "bbr" ]]; then
+                    echo -e "${YELLOW}BBR 已开启，但当前默认队列为 ${CURRENT_QDISC:-未知}，不是 fq。${NC}"
+                    read -p "是否只补充并启用 FQ？[y/N]: " confirm_fq
+                    if [[ "$confirm_fq" == "y" || "$confirm_fq" == "Y" ]]; then
+                        persist_bbr_settings "$CURRENT_CC" "$CURRENT_QDISC" 0
+                    else
+                        log "已保留当前 BBR 与队列配置。"
+                    fi
+                    read -p "按回车键继续..."; continue
+                fi
+
                 K_MAJOR=$(uname -r | cut -d. -f1)
                 K_MINOR=$(uname -r | cut -d. -f2)
                 if [[ "$K_MAJOR" -lt 4 ]] || [[ "$K_MAJOR" -eq 4 && "$K_MINOR" -lt 9 ]]; then
@@ -793,43 +1241,15 @@ submenu_net() {
                     read -p "按回车键继续..."; continue
                 fi
                 
-                log "开始基于 $OS_ID $OS_VERSION 架构校验并配置 BBR..."
-                
-                # 补丁：简化且安全的逻辑分支
-                if [[ "$OS_ID" == "debian" ]]; then
-                    if [[ "$OS_VERSION" =~ ^[0-9]+$ && "$OS_VERSION" -le 12 ]]; then
-                        modprobe tcp_bbr 2>/dev/null
-                    elif [[ "$OS_VERSION" =~ ^[0-9]+$ && "$OS_VERSION" -ge 13 ]]; then
-                        log "Debian 13+ 内核已内置 BBR，跳过模块手动加载..."
-                    fi
-                elif [[ "$OS_ID" == "ubuntu" ]]; then
-                    UBUNTU_MAJOR="${OS_VERSION%%.*}"
-                    if [[ "$UBUNTU_MAJOR" =~ ^[0-9]+$ && "$UBUNTU_MAJOR" -le 20 ]]; then
-                        modprobe tcp_bbr 2>/dev/null
-                    else
-                        log "Ubuntu 22.04+ 内核已内置 BBR，跳过模块手动加载..."
-                    fi
-                else
-                    modprobe tcp_bbr 2>/dev/null
-                fi
+                log "正在根据当前内核的实际能力检测并配置 BBR..."
+                command -v modprobe >/dev/null 2>&1 && modprobe tcp_bbr >/dev/null 2>&1 || true
                 
                 if ! grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
                     error "当前内核未包含 BBR 支持，开启失败！"
                     read -p "按回车键继续..."; continue
                 fi
                 
-                mkdir -p /etc/sysctl.d/
-                cat > "$SYSCTL_FILE" <<EOF
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-EOF
-                sysctl --system >/dev/null 2>&1
-                
-                if sysctl net.ipv4.tcp_congestion_control | grep -q bbr; then
-                    log "BBR 加速模块开启成功！(当前: $(sysctl -n net.ipv4.tcp_congestion_control))"
-                else
-                    error "BBR 开启失败！请检查系统环境或尝试重启服务器。"
-                fi
+                persist_bbr_settings "$CURRENT_CC" "$CURRENT_QDISC" 1
                 read -p "按回车键继续..." 
                 ;;
             2) submenu_dns ;;

@@ -3,7 +3,7 @@
 [![Quality](https://github.com/allury/vps-init/actions/workflows/quality.yml/badge.svg)](https://github.com/allury/vps-init/actions/workflows/quality.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-面向 Debian 和 Ubuntu VPS 的交互式初始化与安全加固脚本。当前版本为 **1.1.1**，集中提供系统更新、SWAP、时区、SSH、Fail2ban、BBR、DNS 和 IPv6 等常用运维操作。
+面向 Debian 和 Ubuntu VPS 的交互式初始化与安全加固脚本。当前版本为 **1.1.2**，集中提供系统更新、SWAP、时区、SSH、Fail2ban、BBR、DNS 和 IPv6 等常用运维操作。
 
 > [!WARNING]
 > 本项目会修改 SSH、网络、内核及系统服务配置。运行前请创建快照、确认云厂商控制台可用，并保留一个已登录的备用会话。请先在测试实例验证，再用于生产环境。
@@ -21,6 +21,14 @@
 - 关键 SSH 操作的配置校验与失败回滚
 - Ubuntu 24.04+ `ssh.socket` 处理、真实监听端口检测和 Fail2ban 端口同步
 - BBR、SSH、DNS、IPv6、SWAP 与 Fail2ban 关键状态汇总
+
+## 1.1.2 更新
+
+- SWAP 删除只处理脚本管理的 `/swapfile`，操作前确认并备份 `/etc/fstab`，不会再卸载或删除其他 SWAP。
+- BBR 根据当前运行状态处理：`bbr + fq` 已生效时不修改文件；仅缺 FQ 时征询后只补 FQ；未启用 BBR 时才搜索现有 `/etc` TCP 配置并安全补齐两项。
+- 没有可复用的 `/etc` TCP 配置时才新建 `/etc/sysctl.d/99-vps-init.conf`；系统目录中的配置只读不改，多个候选文件交由用户选择。
+- BBR 仍只配置 `net.core.default_qdisc=fq` 与 `net.ipv4.tcp_congestion_control=bbr`，不加入额外 TCP 调优参数。
+- DNS 地址增加格式校验；修改前统一备份，应用后验证默认路由与域名解析，失败时自动回滚。
 
 ## 1.1.1 更新
 
