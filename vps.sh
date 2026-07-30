@@ -9,6 +9,7 @@ YELLOW='\033[0;33m'
 NC='\033[0m'
 LOG_FILE="/var/log/vps_init.log"
 SYSCTL_FILE="/etc/sysctl.d/99-vps-init.conf"
+VERSION="1.1.1"
 
 touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/vps_init.log"
 
@@ -20,6 +21,42 @@ log() {
 error() {
     echo -e "${RED}[错误]${NC} $1"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $1" | sed -r 's/\x1B\[[0-9;]*[mK]//g' >> "$LOG_FILE"
+}
+
+get_ssh_port() {
+    sshd -T 2>/dev/null | awk '/^port /{print $2; exit}'
+}
+
+get_listening_ssh_ports() {
+    ss -ltnp 2>/dev/null | awk '
+        /sshd/ {
+            address=$4
+            sub(/^.*:/, "", address)
+            if (address ~ /^[0-9]+$/ && !seen[address]++) ports[++count]=address
+        }
+        END {
+            for (i=1; i<=count; i++) printf "%s%s", ports[i], (i<count ? "," : "")
+        }'
+}
+
+sync_fail2ban_ssh_port() {
+    local port="$1"
+
+    if ! command -v fail2ban-client >/dev/null 2>&1; then
+        return 0
+    fi
+
+    mkdir -p /etc/fail2ban/jail.d
+    cat > /etc/fail2ban/jail.d/99-vps-init-port.local <<EOF
+[sshd]
+port = $port
+EOF
+
+    if systemctl restart fail2ban; then
+        log "Fail2ban 已同步监听 SSH 端口 $port。"
+    else
+        error "Fail2ban 端口已写入，但服务重启失败；请执行 fail2ban-client -t 检查配置。"
+    fi
 }
 
 if [[ $EUID -ne 0 ]]; then
@@ -59,6 +96,7 @@ restart_ssh() {
             # Ubuntu 24.04+ 必须切换到 ssh.service，socket 不重新监听新端口
             systemctl stop ssh.socket 2>/dev/null
             systemctl disable ssh.socket 2>/dev/null
+            systemctl mask ssh.socket >/dev/null 2>&1 || true
             systemctl enable ssh.service 2>/dev/null
             systemctl daemon-reload
             systemctl restart ssh.service
@@ -275,6 +313,10 @@ submenu_env() {
                     apt-get autoremove --purge -y && apt-get clean
                 fi
                 log "系统更新与清理完成。"
+                if [[ -f /var/run/reboot-required ]]; then
+                    echo -e "${YELLOW}检测到系统需要重启。请重启后再确认新内核和 BBR 是否完全生效。${NC}"
+                    [[ -f /var/run/reboot-required.pkgs ]] && sed 's/^/ - /' /var/run/reboot-required.pkgs
+                fi
                 read -p "按回车键继续..." 
                 ;;
             2) submenu_swap ;;
@@ -294,13 +336,16 @@ submenu_ssh() {
         echo "=================================="
         echo "   --- 三级菜单：SSH 安全设置 ---"
         echo "=================================="
-        CURRENT_PORT=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')
+        CURRENT_PORT=$(get_ssh_port)
         [[ -z "$CURRENT_PORT" ]] && CURRENT_PORT="未知"
+        LISTENING_PORTS=$(get_listening_ssh_ports)
+        [[ -z "$LISTENING_PORTS" ]] && LISTENING_PORTS="未检测到"
         
         PWD_AUTH=$(sshd -T 2>/dev/null | grep -i "^passwordauthentication " | awk '{print $2}')
         [[ "$PWD_AUTH" == "yes" ]] && PWD_STATUS="${RED}已开启 (存在爆破风险)${NC}" || PWD_STATUS="${GREEN}已禁用 (安全)${NC}"
         
-        echo -e "当前 SSH 端口: ${YELLOW}$CURRENT_PORT${NC}"
+        echo -e "配置的 SSH 端口: ${YELLOW}$CURRENT_PORT${NC}"
+        echo -e "实际监听端口:     ${YELLOW}$LISTENING_PORTS${NC}"
         echo -e "密码登录状态:  $PWD_STATUS"
         echo "----------------------------------"
         echo "1. 更改 SSH 端口 (带冲突检测与自动回滚)"
@@ -357,7 +402,10 @@ submenu_ssh() {
                     read -p "按回车键继续..."; continue
                 fi
                 
-                log "SSH 端口修改成功！请确保控制台已放行 $new_port 端口，并新开终端验证后再关闭当前会话。"
+                sync_fail2ban_ssh_port "$new_port"
+                LISTENING_PORTS=$(get_listening_ssh_ports)
+                log "SSH 端口修改成功，当前实际监听：${LISTENING_PORTS:-未知}。"
+                echo -e "${YELLOW}请先在新终端使用端口 $new_port 登录成功，再关闭当前会话；同时确认云安全组和防火墙已放行。${NC}"
                 read -p "按回车键继续..."
                 ;;
                 
@@ -432,7 +480,7 @@ submenu_sec() {
                 apt-get install fail2ban -y >/dev/null 2>&1 || { error "Fail2ban 安装失败！"; read -p "按回车键继续..."; continue; }
                 
                 log "正在配置防爆破规则..."
-                CURRENT_PORT=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')
+                CURRENT_PORT=$(get_ssh_port)
                 [[ -z "$CURRENT_PORT" ]] && CURRENT_PORT=22
                 
                 UBUNTU_MAJOR="${OS_VERSION%%.*}"
@@ -471,6 +519,119 @@ EOF
 # ==========================================
 # 模块三：三级菜单 D - DNS 设置
 # ==========================================
+show_dns_status() {
+    if systemctl is-active systemd-resolved >/dev/null 2>&1 && command -v resolvectl >/dev/null 2>&1; then
+        resolvectl dns 2>/dev/null | sed 's/^/ - /'
+    else
+        grep -E '^[[:space:]]*nameserver[[:space:]]+' /etc/resolv.conf 2>/dev/null | awk '{print " - "$2}'
+    fi
+}
+
+sync_interfaces_dns() {
+    local dns_line="$1"
+    local file
+    local updated=0
+    local -a interface_files=()
+
+    [[ -f /etc/network/interfaces ]] && interface_files+=(/etc/network/interfaces)
+    if [[ -d /etc/network/interfaces.d ]]; then
+        while IFS= read -r -d '' file; do
+            interface_files+=("$file")
+        done < <(find /etc/network/interfaces.d -maxdepth 1 -type f -print0 2>/dev/null)
+    fi
+
+    for file in "${interface_files[@]}"; do
+        if grep -qE '^[[:space:]]*dns-nameservers[[:space:]]+' "$file"; then
+            cp -a "$file" "${file}.vps-init.bak"
+            sed -i -E "s|^[[:space:]]*dns-nameservers[[:space:]].*|    dns-nameservers $dns_line|" "$file"
+            updated=1
+            [[ "$file" == *50-cloud-init* ]] && echo -e "${YELLOW}注意：$file 由 cloud-init 生成，云平台在后续启动时仍可能覆盖它。${NC}"
+        fi
+    done
+
+    [[ "$updated" == "1" ]] && log "已同步 interfaces 系列配置中的 dns-nameservers。"
+}
+
+sync_netplan_dns() {
+    local dns_csv="$1"
+    local default_iface
+    local override_file="/etc/netplan/99-vps-init-dns.yaml"
+    local backup_file="${override_file}.bak"
+
+    command -v netplan >/dev/null 2>&1 || return 0
+    [[ -d /etc/netplan ]] || return 0
+
+    default_iface=$(ip -o route show default 2>/dev/null | awk '{print $5; exit}')
+    if [[ -z "$default_iface" ]] || ! netplan get "ethernets.${default_iface}" >/dev/null 2>&1; then
+        echo -e "${YELLOW}检测到 netplan，但默认网卡不在 ethernets 中；为避免中断网络，已跳过自动写入。${NC}"
+        return 0
+    fi
+
+    if [[ -f "$override_file" ]]; then
+        cp -a "$override_file" "$backup_file"
+    else
+        rm -f "$backup_file"
+    fi
+    cat > "$override_file" <<EOF
+network:
+  version: 2
+  ethernets:
+    $default_iface:
+      nameservers:
+        addresses: [$dns_csv]
+EOF
+    chmod 600 "$override_file"
+
+    if netplan generate >/dev/null 2>&1; then
+        if netplan apply; then
+            log "已通过 netplan 为 $default_iface 同步 DNS。"
+        else
+            error "netplan apply 失败，正在恢复之前的 override。"
+            if [[ -f "$backup_file" ]]; then
+                cp -a "$backup_file" "$override_file"
+            else
+                rm -f "$override_file"
+            fi
+            netplan generate >/dev/null 2>&1 && netplan apply >/dev/null 2>&1 || true
+        fi
+    else
+        error "netplan 配置校验失败，正在恢复 DNS override。"
+        if [[ -f "$backup_file" ]]; then
+            cp -a "$backup_file" "$override_file"
+        else
+            rm -f "$override_file"
+        fi
+    fi
+}
+
+apply_dns_servers() {
+    local dns_line="$1"
+    local dns_csv="${dns_line// /, }"
+    local dns_server
+
+    sync_interfaces_dns "$dns_line"
+    sync_netplan_dns "$dns_csv"
+
+    if systemctl is-active systemd-resolved >/dev/null 2>&1; then
+        mkdir -p /etc/systemd/resolved.conf.d/
+        cat > /etc/systemd/resolved.conf.d/99-vps-init-dns.conf <<EOF
+[Resolve]
+DNS=$dns_line
+FallbackDNS=
+EOF
+        systemctl restart systemd-resolved || return 1
+    else
+        chattr -i /etc/resolv.conf >/dev/null 2>&1 || true
+        [[ -L /etc/resolv.conf ]] && rm -f /etc/resolv.conf
+        : > /etc/resolv.conf
+        for dns_server in $dns_line; do
+            printf 'nameserver %s\n' "$dns_server" >> /etc/resolv.conf
+        done
+    fi
+
+    return 0
+}
+
 submenu_dns() {
     while true; do
         clear
@@ -478,13 +639,9 @@ submenu_dns() {
         echo "      --- 三级菜单：DNS 设置 ---"
         echo "=================================="
         echo "当前生效 DNS 配置："
-        if systemctl is-active systemd-resolved >/dev/null 2>&1 && command -v resolvectl >/dev/null 2>&1; then
-            resolvectl status global 2>/dev/null | grep -E "DNS Servers|DNS Server" | sed 's/^[ \t]*//' | awk '{print " - "$NF}' | sort -u
-        else
-            grep "^nameserver" /etc/resolv.conf | awk '{print " - "$2}'
-        fi
+        show_dns_status
         echo "----------------------------------"
-        echo "1. 快速设置为 Cloudflare (1.1.1.1 / 1.0.0.1)"
+        echo "1. 快速设置为 Cloudflare (IPv4 + IPv6)"
         echo "2. 快速设置为 Google (8.8.8.8 / 8.8.4.4)"
         echo -e "${GREEN}3. 手动输入自定义 DNS 地址 (支持 IPv4/IPv6)${NC}"
         echo "0. 返回上一级菜单"
@@ -492,12 +649,18 @@ submenu_dns() {
         read -p "请输入选项 [0-3]: " choice_dns
 
         IPV6_STATUS=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
-        dns1=""
-        dns2=""
+        DNS_ENTRY=""
 
         case "$choice_dns" in
-            1) dns1="1.1.1.1"; dns2="1.0.0.1" ;;
-            2) dns1="8.8.8.8"; dns2="8.8.4.4" ;;
+            1)
+                DNS_ENTRY="1.1.1.1 1.0.0.1"
+                if [[ "$IPV6_STATUS" != "1" ]]; then
+                    DNS_ENTRY+=" 2606:4700:4700::1111 2606:4700:4700::1001"
+                else
+                    echo -e "${YELLOW}当前 IPv6 已禁用，Cloudflare IPv6 DNS 已自动跳过。${NC}"
+                fi
+                ;;
+            2) DNS_ENTRY="8.8.8.8 8.8.4.4" ;;
             3)
                 read -p "请输入首选 DNS 地址: " dns1
                 read -p "请输入备用 DNS 地址 (留空则不设置): " dns2
@@ -513,35 +676,23 @@ submenu_dns() {
                         read -p "按回车键继续..."; continue
                     fi
                 fi
+                DNS_ENTRY="$dns1"
+                [[ -n "$dns2" ]] && DNS_ENTRY+=" $dns2"
                 ;;
             0) return ;;
             *) error "无效选项！"; sleep 1; continue ;;
         esac
 
         log "正在配置 DNS..."
-        DNS_ENTRY="$dns1"
-        [[ -n "$dns2" ]] && DNS_ENTRY="$dns1 $dns2"
-
-        if systemctl is-active systemd-resolved >/dev/null 2>&1; then
-            log "检测到 systemd-resolved，正在应用 override 配置..."
-            mkdir -p /etc/systemd/resolved.conf.d/
-            cat > /etc/systemd/resolved.conf.d/dns.conf <<EOF
-[Resolve]
-DNS=$DNS_ENTRY
-FallbackDNS=
-EOF
-            systemctl restart systemd-resolved || { error "systemd-resolved 重启失败！"; read -p "按回车键继续..."; continue; }
-        else
-            log "正在写入传统 /etc/resolv.conf 配置..."
-            chattr -i /etc/resolv.conf >/dev/null 2>&1
-            [ -L /etc/resolv.conf ] && rm -f /etc/resolv.conf
-            echo "nameserver $dns1" > /etc/resolv.conf
-            [[ -n "$dns2" ]] && echo "nameserver $dns2" >> /etc/resolv.conf
-            chattr +i /etc/resolv.conf >/dev/null 2>&1
+        if ! apply_dns_servers "$DNS_ENTRY"; then
+            error "DNS 配置未能完全应用，请根据日志检查网络配置。"
+            read -p "按回车键继续..."; continue
         fi
         
         sleep 1
         log "DNS 修改成功！"
+        echo "当前检测到的 DNS："
+        show_dns_status
         read -p "按回车键继续..."
     done
 }
@@ -598,7 +749,7 @@ submenu_ipv6() {
                 sed -i '/^net.ipv6.conf.all.disable_ipv6/d' /etc/sysctl.conf
                 sed -i '/^net.ipv6.conf.default.disable_ipv6/d' /etc/sysctl.conf
                 sed -i '/^net.ipv6.conf.lo.disable_ipv6/d' /etc/sysctl.conf
-                
+
                 echo "net.ipv6.conf.all.disable_ipv6 = $target_val" >> /etc/sysctl.conf
                 echo "net.ipv6.conf.default.disable_ipv6 = $target_val" >> /etc/sysctl.conf
                 echo "net.ipv6.conf.lo.disable_ipv6 = $target_val" >> /etc/sysctl.conf
@@ -692,6 +843,53 @@ EOF
 # ==========================================
 # 主菜单入口
 # ==========================================
+show_status_summary() {
+    local ssh_port
+    local listening_ports
+    local password_auth
+    local ipv6_disabled
+    local ip_preference
+    local fail2ban_status
+
+    ssh_port=$(get_ssh_port)
+    listening_ports=$(get_listening_ssh_ports)
+    password_auth=$(sshd -T 2>/dev/null | awk '/^passwordauthentication /{print $2; exit}')
+    ipv6_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
+    if [[ "$ipv6_disabled" == "1" ]]; then
+        ip_preference="IPv6 已禁用"
+    elif grep -q '^precedence ::ffff:0:0/96' /etc/gai.conf 2>/dev/null; then
+        ip_preference="IPv4 优先"
+    else
+        ip_preference="系统默认"
+    fi
+    fail2ban_status=$(systemctl is-active fail2ban 2>/dev/null || true)
+
+    clear
+    echo "=================================================="
+    echo "             VPS 关键状态汇总"
+    echo "=================================================="
+    echo "版本:                 $VERSION"
+    echo "拥塞控制 / 队列:      $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 未知) / $(sysctl -n net.core.default_qdisc 2>/dev/null || echo 未知)"
+    echo "TCP 读缓冲上限:       $(sysctl -n net.core.rmem_max 2>/dev/null || echo 未知) bytes"
+    echo "TCP 写缓冲上限:       $(sysctl -n net.core.wmem_max 2>/dev/null || echo 未知) bytes"
+    echo "netdev backlog:        $(sysctl -n net.core.netdev_max_backlog 2>/dev/null || echo 未知)"
+    echo "SSH 配置端口:          ${ssh_port:-未知}"
+    echo "SSH 实际监听:          ${listening_ports:-未检测到}"
+    echo "SSH 密码登录:          ${password_auth:-未知}"
+    echo "IPv4/IPv6 优先级:      $ip_preference"
+    echo "Fail2ban:              ${fail2ban_status:-未安装或未运行}"
+    echo "SWAP:                  $(free -h | awk '/^Swap/{print $2" 总 / "$3" 已用"}')"
+    if [[ -f /var/run/reboot-required ]]; then
+        echo -e "重启状态:              ${YELLOW}需要重启${NC}"
+    else
+        echo "重启状态:              当前未检测到重启要求"
+    fi
+    echo "DNS:"
+    show_dns_status
+    echo "=================================================="
+    read -p "按回车键返回主菜单..."
+}
+
 main_menu() {
     while true; do
         MEM_STATUS=$(free -h | awk '/^Mem/{print $2" 总 / "$3" 已用"}')
@@ -700,7 +898,7 @@ main_menu() {
         
         clear
         echo "=================================================="
-        echo -e "         ${GREEN}VPS 极简初始化与安全加固脚本${NC}"
+        echo -e "      ${GREEN}VPS 极简初始化与安全加固脚本 v$VERSION${NC}"
         echo "=================================================="
         echo -e "  当前系统: ${YELLOW}$OS_ID $OS_VERSION${NC}"
         echo -e "  系统负载: ${YELLOW}$LOAD_AVG${NC}"
@@ -710,15 +908,17 @@ main_menu() {
         echo "  1. 基础环境与系统优化   # 更新/SWAP/时区"
         echo "  2. 系统安全与防火墙     # SSH加固/防爆破"
         echo "  3. 网络与内核优化       # BBR/DNS/IPv6"
+        echo "  4. 查看当前关键状态     # 网络/SSH/DNS/Fail2ban"
         echo "--------------------------------------------------"
         echo "  0. 退出脚本"
         echo "=================================================="
-        read -p "请输入选项 [0-3]: " choice_main
+        read -p "请输入选项 [0-4]: " choice_main
 
         case "$choice_main" in
             1) submenu_env ;;
             2) submenu_sec ;;
             3) submenu_net ;;
+            4) show_status_summary ;;
             0) clear; log "已安全退出脚本。"; exit 0 ;;
             *) error "无效输入，请重新选择！"; sleep 1 ;;
         esac
