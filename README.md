@@ -51,7 +51,6 @@
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/allury/vps-init/main/vps.sh -o vps.sh
-less vps.sh
 chmod +x vps.sh
 sudo ./vps.sh
 ```
