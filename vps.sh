@@ -899,7 +899,7 @@ sync_interfaces_dns() {
     fi
 
     for file in "${interface_files[@]}"; do
-        if grep -qE "^[[:space:]]*iface[[:space:]]+$default_iface[[:space:]]+inet[[:space:]]+" "$file"; then
+        if grep -qE "^[[:space:]]*iface[[:space:]]+${default_iface}[[:space:]]+inet[[:space:]]+" "$file"; then
             matches+=("$file")
         fi
     done
