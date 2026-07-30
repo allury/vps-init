@@ -1,0 +1,34 @@
+name: 功能建议
+description: 建议新的功能或兼容性改进
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 使用场景
+      description: 请说明要解决的问题，而不只是期望的实现。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议方案
+      description: 描述建议行为、交互和安全边界。
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: 相关操作系统
+      placeholder: Debian 13 / Ubuntu 24.04 / 全部
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 替代方案
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已搜索现有 Issue，未发现重复建议。
+          required: true
