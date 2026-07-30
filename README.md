@@ -1,33 +1,65 @@
 # VPS Hardening Toolkit
 
-一键初始化与安全加固 Linux VPS 的交互式脚本，覆盖系统更新、SWAP/时区管理、SSH 强化、Fail2ban 部署、BBR 开启、DNS/IPv6 优化等常用运维操作。
+[![Quality](https://github.com/allury/vps-init/actions/workflows/quality.yml/badge.svg)](https://github.com/allury/vps-init/actions/workflows/quality.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-## 特性
+面向 Debian 和 Ubuntu VPS 的交互式初始化与安全加固脚本。它集中提供系统更新、SWAP、时区、SSH、Fail2ban、BBR、DNS 和 IPv6 等常用运维操作。
 
-- **基础环境优化**：智能系统更新、清理旧内核、快速创建/删除 SWAP、同步时间与时区
-- **SSH 安全强化**：修改默认端口（带端口冲突检测、监听验证与自动回滚）、强制密钥登录并禁用密码（严格校验公钥）
-- **Fail2ban 自动部署**：自动适配系统日志后端，即装即用
-- **网络与内核调优**：一键开启 BBR + FQ 队列、灵活设置 DNS、调整 IPv4/IPv6 优先级或禁用 IPv6
-- **全面兼容**：Debian 12/13、Ubuntu 20.04/22.04/24.04 等主流版本，精准识别系统环境
-- **安全可靠**：所有关键操作均有备份与自动回滚机制，防误配置导致失联
+> [!WARNING]
+> 本项目会修改 SSH、网络、内核及系统服务配置。运行前请创建快照、确认云厂商控制台可用，并保留一个已登录的备用会话。请先在测试实例验证，再用于生产环境。
 
-## 支持的操作系统
+## 功能
 
-| 系统     | 版本                  | 说明                          |
-|----------|-----------------------|-------------------------------|
-| Debian   | 12 / 13               | 含 testing/trixie 补丁        |
-| Ubuntu   | 20.04 / 22.04 / 24.04 | 完整适配 systemd 生态         |
+- 系统更新与软件包清理
+- SWAP 创建、检查与删除
+- 时区和时间同步配置
+- SSH 端口及密钥登录加固
+- Fail2ban 安装与规则配置
+- BBR 与 FQ 队列配置
+- DNS、IPv4/IPv6 优先级和 IPv6 开关
+- 关键 SSH 操作的配置校验与失败回滚
 
-> ⚠️ 目前仅针对 **Debian/Ubuntu** 系列进行适配，其他发行版未测试。
+## 支持范围
+
+| 系统 | 版本 | 状态 |
+| --- | --- | --- |
+| Debian | 12 / 13 | 支持 |
+| Ubuntu | 20.04 / 22.04 / 24.04 | 支持 |
+
+其他发行版尚未经过验证。脚本依赖 Bash、systemd 和 Debian 系软件包管理工具。
 
 ## 快速开始
 
-### 1. 下载并运行
-
-以 **root** 身份执行以下命令：
+请先阅读脚本，再以 `root` 权限运行：
 
 ```bash
-# 推荐方式（获取最新版）
-wget -O vps.sh https://raw.githubusercontent.com/allury/vps-init/main/vps.sh
+curl -fsSL https://raw.githubusercontent.com/allury/vps-init/main/vps.sh -o vps.sh
+less vps.sh
 chmod +x vps.sh
-sudo bash vps.sh
+sudo ./vps.sh
+```
+
+不建议直接使用 `curl | bash`，因为这会跳过运行前审查。
+
+## 运行前检查
+
+1. 为 VPS 创建可恢复的快照。
+2. 确认能够通过云厂商控制台或救援模式登录。
+3. 将 SSH 公钥写入 `/root/.ssh/authorized_keys`。
+4. 修改 SSH 端口时，同步更新安全组和防火墙规则。
+5. 在关闭当前 SSH 会话前，用新会话验证登录。
+
+脚本日志默认写入 `/var/log/vps_init.log`；不可写时会回退到 `/tmp/vps_init.log`。
+
+## 开发与检查
+
+```bash
+bash -n vps.sh
+shellcheck --severity=error vps.sh
+```
+
+提交代码前请阅读 [贡献指南](CONTRIBUTING.md)。安全问题请按 [安全策略](SECURITY.md) 私下报告，不要公开创建 Issue。
+
+## 许可证
+
+本项目采用 [MIT License](LICENSE)。
