@@ -3,15 +3,31 @@
 # ==========================================
 # 0. 全局变量与前置环境配置
 # ==========================================
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-NC='\033[0m'
+RED=''
+GREEN=''
+YELLOW=''
+CYAN=''
+BOLD=''
+DIM=''
+NC=''
 LOG_FILE="/var/log/vps_init.log"
 SYSCTL_FILE="/etc/sysctl.d/99-vps-init.conf"
-VERSION="1.1.2"
+IPV6_SYSCTL_FILE="/etc/sysctl.d/99-zz-vps-init-ipv6.conf"
+SWAP_SYSCTL_FILE="/etc/sysctl.d/99-zz-vps-init-swap.conf"
+SSH_MANAGED_FILE="/etc/ssh/sshd_config.d/00-00-vps-init.conf"
+VERSION="1.1.3"
 MANAGED_SWAP_FILE="/swapfile"
 BACKUP_DIR="/var/backups/vps-init"
+
+if [[ -t 1 && "${TERM:-}" != "dumb" && -z "${NO_COLOR:-}" ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    CYAN='\033[0;36m'
+    BOLD='\033[1m'
+    DIM='\033[2m'
+    NC='\033[0m'
+fi
 
 touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/vps_init.log"
 
@@ -23,6 +39,58 @@ log() {
 error() {
     echo -e "${RED}[错误]${NC} $1"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $1" | sed -r 's/\x1B\[[0-9;]*[mK]//g' >> "$LOG_FILE"
+}
+
+warn() {
+    echo -e "${YELLOW}[注意]${NC} $1"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] $1" | sed -r 's/\x1B\[[0-9;]*[mK]//g' >> "$LOG_FILE"
+}
+
+pause_menu() {
+    read -r -p "按回车键继续..."
+}
+
+confirm_action() {
+    local prompt="$1"
+    local answer
+
+    read -r -p "$prompt [y/N]: " answer
+    [[ "$answer" == "y" || "$answer" == "Y" ]]
+}
+
+print_header() {
+    local title="$1"
+
+    clear
+    echo -e "${CYAN}==================================================${NC}"
+    echo -e "${BOLD}${CYAN}  $title${NC}"
+    echo -e "${CYAN}==================================================${NC}"
+}
+
+print_menu_item() {
+    local number="$1"
+    local label="$2"
+    local description="${3:-}"
+
+    if [[ -n "$description" ]]; then
+        echo -e "  ${GREEN}${number}.${NC} ${label} ${DIM}${description}${NC}"
+    else
+        echo -e "  ${GREEN}${number}.${NC} ${label}"
+    fi
+}
+
+print_result() {
+    local label="$1"
+    local state="$2"
+    local detail="${3:-}"
+    local color="$YELLOW"
+
+    case "$state" in
+        正常|已启用|运行中) color="$GREEN" ;;
+        异常|失败|已禁用) color="$RED" ;;
+    esac
+    printf '  %-22s ' "$label"
+    echo -e "${color}${state}${NC}${detail:+  $detail}"
 }
 
 get_ssh_port() {
@@ -76,74 +144,74 @@ add_unique_path() {
 scan_sysctl_configs() {
     local dir
     local file
+    local filename
     local real_file
     local is_etc_file
-    local -A seen_files=()
+    local name
+    local -A effective_by_name=()
     local -a scan_dirs=(/etc/sysctl.d /run/sysctl.d /usr/local/lib/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d)
+    local -a sorted_names=()
 
     ALL_SYSCTL_FILES=()
+    EFFECTIVE_SYSCTL_FILES=()
     ETC_KEY_FILES=()
     ETC_TCP_FILES=()
     READONLY_TCP_FILES=()
     LEGACY_TCP_FILES=()
+    LAST_EFFECTIVE_KEY_FILE=""
+    LAST_EFFECTIVE_TCP_FILE=""
 
     for dir in "${scan_dirs[@]}"; do
         [[ -d "$dir" ]] || continue
         while IFS= read -r -d '' file; do
-            real_file=$(readlink -f "$file" 2>/dev/null || printf '%s' "$file")
-            [[ -n "${seen_files[$real_file]+x}" ]] && continue
-            seen_files[$real_file]=1
-            ALL_SYSCTL_FILES+=("$file")
+            filename=$(basename "$file")
+            [[ -n "${effective_by_name[$filename]+x}" ]] && continue
+            effective_by_name[$filename]="$file"
         done < <(find "$dir" -maxdepth 1 \( -type f -o -type l \) -name '*.conf' -print0 2>/dev/null)
     done
+
+    if (( ${#effective_by_name[@]} > 0 )); then
+        mapfile -t sorted_names < <(printf '%s\n' "${!effective_by_name[@]}" | LC_ALL=C sort)
+        for name in "${sorted_names[@]}"; do
+            EFFECTIVE_SYSCTL_FILES+=("${effective_by_name[$name]}")
+        done
+    fi
+    ALL_SYSCTL_FILES=("${EFFECTIVE_SYSCTL_FILES[@]}")
+
     if [[ -f /etc/sysctl.conf ]]; then
         real_file=$(readlink -f /etc/sysctl.conf 2>/dev/null || printf '%s' /etc/sysctl.conf)
-        if [[ -z "${seen_files[$real_file]+x}" ]]; then
-            seen_files[$real_file]=1
-            ALL_SYSCTL_FILES+=(/etc/sysctl.conf)
+        for file in "${EFFECTIVE_SYSCTL_FILES[@]}"; do
+            if [[ "$(readlink -f "$file" 2>/dev/null || printf '%s' "$file")" == "$real_file" ]]; then
+                real_file=""
+                break
+            fi
+        done
+        if [[ -n "$real_file" ]] && grep -qE '^[[:space:]]*-?[[:space:]]*(net\.ipv4\.tcp_[A-Za-z0-9_]*|net\.core\.[A-Za-z0-9_]*)[[:space:]]*=' /etc/sysctl.conf; then
+            LEGACY_TCP_FILES+=(/etc/sysctl.conf)
         fi
     fi
 
-    for file in "${ALL_SYSCTL_FILES[@]}"; do
+    for file in "${EFFECTIVE_SYSCTL_FILES[@]}"; do
         real_file=$(readlink -f "$file" 2>/dev/null || printf '%s' "$file")
         is_etc_file=0
         [[ "$file" == /etc/* && "$real_file" == /etc/* ]] && is_etc_file=1
 
-        if grep -qE '^[[:space:]]*(net\.ipv4\.tcp_congestion_control|net\.core\.default_qdisc)[[:space:]]*=' "$file"; then
-            if [[ "$file" == "/etc/sysctl.conf" ]]; then
-                add_unique_path LEGACY_TCP_FILES "$file"
-            elif [[ "$is_etc_file" == "1" ]]; then
+        if grep -qE '^[[:space:]]*-?[[:space:]]*(net\.ipv4\.tcp_congestion_control|net\.core\.default_qdisc)[[:space:]]*=' "$file" 2>/dev/null; then
+            LAST_EFFECTIVE_KEY_FILE="$file"
+            if [[ "$is_etc_file" == "1" ]]; then
                 add_unique_path ETC_KEY_FILES "$file"
             else
                 add_unique_path READONLY_TCP_FILES "$file"
             fi
         fi
 
-        if grep -qE '^[[:space:]]*(net\.ipv4\.tcp_[A-Za-z0-9_]*|net\.core\.[A-Za-z0-9_]*)[[:space:]]*=' "$file"; then
-            if [[ "$file" == "/etc/sysctl.conf" ]]; then
-                add_unique_path LEGACY_TCP_FILES "$file"
-            elif [[ "$is_etc_file" == "1" ]]; then
+        if grep -qE '^[[:space:]]*-?[[:space:]]*(net\.ipv4\.tcp_[A-Za-z0-9_]*|net\.core\.[A-Za-z0-9_]*)[[:space:]]*=' "$file" 2>/dev/null; then
+            LAST_EFFECTIVE_TCP_FILE="$file"
+            if [[ "$is_etc_file" == "1" ]]; then
                 add_unique_path ETC_TCP_FILES "$file"
             else
                 add_unique_path READONLY_TCP_FILES "$file"
             fi
-        fi
-    done
-}
-
-filter_high_priority_sysctl_files() {
-    local source_name="$1"
-    local target_name="$2"
-    local file
-    local filename
-    local -n source_array="$source_name"
-    local -n target_array="$target_name"
-
-    target_array=()
-    for file in "${source_array[@]}"; do
-        filename=$(basename "$file")
-        if [[ "$filename" > "59-" ]]; then
-            add_unique_path "$target_name" "$file"
         fi
     done
 }
@@ -160,7 +228,7 @@ choose_path_interactively() {
         printf ' %d. %s\n' "$((index + 1))" "${candidates[$index]}"
     done
     echo " 0. 取消"
-    read -p "请选择配置文件: " choice
+    read -r -p "请选择配置文件: " choice
     if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#candidates[@]} )); then
         SYSCTL_TARGET=""
         return 1
@@ -169,44 +237,58 @@ choose_path_interactively() {
 }
 
 select_sysctl_target() {
-    local -a high_priority_key_files=()
-    local -a high_priority_tcp_files=()
     local resolved_target
+    local latest_key_real
+    local latest_key_name=""
+    local candidate
+    local candidate_name
+    local LC_ALL=C
+    local -a override_candidates=(
+        /etc/sysctl.d/99-vps-init.conf
+        /etc/sysctl.d/zz-vps-init-bbr.conf
+        /etc/sysctl.d/zzzz-vps-init-bbr.conf
+    )
+
     SYSCTL_TARGET=""
     scan_sysctl_configs
-    filter_high_priority_sysctl_files ETC_KEY_FILES high_priority_key_files
-    filter_high_priority_sysctl_files ETC_TCP_FILES high_priority_tcp_files
 
-    if (( ${#high_priority_key_files[@]} == 1 )); then
-        SYSCTL_TARGET="${high_priority_key_files[0]}"
-    elif (( ${#high_priority_key_files[@]} > 1 )); then
-        choose_path_interactively "检测到多个高优先级 /etc 配置文件定义了 BBR 或队列参数：" "${high_priority_key_files[@]}" || return 1
-    elif (( ${#high_priority_tcp_files[@]} == 1 )); then
-        SYSCTL_TARGET="${high_priority_tcp_files[0]}"
-    elif (( ${#high_priority_tcp_files[@]} > 1 )); then
-        choose_path_interactively "检测到多个高优先级 /etc TCP 参数文件，不自动选择：" "${high_priority_tcp_files[@]}" || return 1
-    elif [[ -f "$SYSCTL_FILE" ]]; then
-        if [[ "$(readlink -f "$SYSCTL_FILE" 2>/dev/null)" == /etc/* ]]; then
-            SYSCTL_TARGET="$SYSCTL_FILE"
+    if [[ -n "$LAST_EFFECTIVE_KEY_FILE" ]]; then
+        latest_key_name=$(basename "$LAST_EFFECTIVE_KEY_FILE")
+        latest_key_real=$(readlink -f "$LAST_EFFECTIVE_KEY_FILE" 2>/dev/null || printf '%s' "$LAST_EFFECTIVE_KEY_FILE")
+        if [[ "$LAST_EFFECTIVE_KEY_FILE" == /etc/* && "$latest_key_real" == /etc/* ]]; then
+            SYSCTL_TARGET="$latest_key_real"
+            log "将更新最终生效的本地 sysctl 文件：$LAST_EFFECTIVE_KEY_FILE"
         else
-            SYSCTL_TARGET="/etc/sysctl.d/99-vps-init-bbr.conf"
-            echo -e "${YELLOW}$SYSCTL_FILE 指向系统目录，不会修改；改用 $SYSCTL_TARGET。${NC}"
+            warn "最终生效的 BBR/队列配置来自只读位置：$LAST_EFFECTIVE_KEY_FILE，将创建更晚加载的本地覆盖文件。"
         fi
-    else
-        SYSCTL_TARGET="$SYSCTL_FILE"
-        if (( ${#READONLY_TCP_FILES[@]} > 0 )); then
-            echo -e "${YELLOW}只在系统只读目录发现 TCP 配置，将使用 $SYSCTL_FILE 覆盖，不修改以下文件：${NC}"
-            printf ' - %s\n' "${READONLY_TCP_FILES[@]}"
-        else
-            log "未发现可安全复用的高优先级 /etc TCP 参数文件，将新建 $SYSCTL_FILE。"
-        fi
+    elif (( ${#ETC_TCP_FILES[@]} == 1 )); then
+        SYSCTL_TARGET="${ETC_TCP_FILES[0]}"
+    elif (( ${#ETC_TCP_FILES[@]} > 1 )); then
+        choose_path_interactively "检测到多个实际参与加载的 /etc TCP 参数文件，请选择写入位置：" "${ETC_TCP_FILES[@]}" || return 1
     fi
 
-    if (( ${#ETC_TCP_FILES[@]} > ${#high_priority_tcp_files[@]} )); then
-        echo -e "${YELLOW}已忽略文件名优先级偏低的 /etc TCP 配置，避免在 Debian 13 启动时被后加载文件覆盖。${NC}"
+    if [[ -z "$SYSCTL_TARGET" ]]; then
+        for candidate in "${override_candidates[@]}"; do
+            candidate_name=$(basename "$candidate")
+            if [[ -n "$latest_key_name" && "$candidate_name" < "$latest_key_name" ]] || [[ "$candidate_name" == "$latest_key_name" ]]; then
+                continue
+            fi
+            if [[ -L "$candidate" ]]; then
+                resolved_target=$(readlink -f "$candidate" 2>/dev/null)
+                [[ "$resolved_target" == /etc/* ]] || continue
+            fi
+            SYSCTL_TARGET="$candidate"
+            break
+        done
+        if [[ -z "$SYSCTL_TARGET" ]]; then
+            error "未找到能够晚于 $latest_key_name 加载的安全本地 sysctl 文件名。"
+            return 1
+        fi
+        log "将使用本地托管配置：$SYSCTL_TARGET"
     fi
+
     if (( ${#LEGACY_TCP_FILES[@]} > 0 )); then
-        echo -e "${YELLOW}检测到裸 /etc/sysctl.conf，但未发现 sysctl.d 链接，因此只检查、不作为 systemd 持久化目标。${NC}"
+        warn "检测到未通过 sysctl.d 链接加载的 /etc/sysctl.conf，仅检查、不直接修改。"
     fi
 
     if [[ -L "$SYSCTL_TARGET" ]]; then
@@ -223,13 +305,43 @@ select_sysctl_target() {
     return 0
 }
 
+get_effective_sysctl_value() {
+    local key="$1"
+    local file
+    local file_value
+    local value=""
+
+    scan_sysctl_configs
+    for file in "${EFFECTIVE_SYSCTL_FILES[@]}"; do
+        file_value=$(awk -v wanted="$key" '
+            {
+                line=$0
+                sub(/^[[:space:]]*-?[[:space:]]*/, "", line)
+                equals=index(line, "=")
+                if (!equals) next
+                lhs=substr(line, 1, equals-1)
+                gsub(/[[:space:]]/, "", lhs)
+                if (lhs != wanted) next
+                rhs=substr(line, equals+1)
+                sub(/^[[:space:]]*/, "", rhs)
+                sub(/[[:space:]]*[#;].*$/, "", rhs)
+                sub(/[[:space:]]*$/, "", rhs)
+                value=rhs
+            }
+            END { if (value != "") print value }
+        ' "$file" 2>/dev/null)
+        [[ -n "$file_value" ]] && value="$file_value"
+    done
+    printf '%s' "$value"
+}
+
 write_sysctl_key() {
     local file="$1"
     local key="$2"
     local value="$3"
     local escaped_key="${key//./\\.}"
 
-    sed -i -E "\\|^[[:space:]]*${escaped_key}[[:space:]]*=|d" "$file"
+    sed -i -E "\\|^[[:space:]]*-?[[:space:]]*${escaped_key}[[:space:]]*=|d" "$file"
     printf '%s = %s\n' "$key" "$value" >> "$file"
 }
 
@@ -240,6 +352,8 @@ persist_bbr_settings() {
     local target_existed=0
     local backup_file=""
     local result_label="BBR + FQ"
+    local effective_cc
+    local effective_qdisc
 
     select_sysctl_target || {
         error "未选择 sysctl 配置文件，已取消 BBR 配置。"
@@ -270,17 +384,23 @@ persist_bbr_settings() {
         error "写入 FQ 配置失败。"
     elif [[ "$write_bbr" == "1" ]] && ! write_sysctl_key "$SYSCTL_TARGET" net.ipv4.tcp_congestion_control bbr; then
         error "写入 BBR 配置失败。"
-    elif sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 && \
-         { [[ "$write_bbr" == "0" ]] || sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; } && \
-         [[ "$(sysctl -n net.core.default_qdisc 2>/dev/null)" == "fq" ]] && \
-         { [[ "$write_bbr" == "0" ]] || [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; }; then
-        log "$result_label 已生效，配置写入 $SYSCTL_TARGET。"
-        [[ -n "$backup_file" ]] && log "原配置备份：$backup_file"
-        return 0
+    else
+        effective_qdisc=$(get_effective_sysctl_value net.core.default_qdisc)
+        effective_cc=$(get_effective_sysctl_value net.ipv4.tcp_congestion_control)
+        if [[ "$effective_qdisc" != "fq" ]] || [[ "$write_bbr" == "1" && "$effective_cc" != "bbr" ]]; then
+            error "配置文件加载顺序验证失败，重启后可能被其他 sysctl 文件覆盖。"
+        elif sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 && \
+             { [[ "$write_bbr" == "0" ]] || sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; } && \
+             [[ "$(sysctl -n net.core.default_qdisc 2>/dev/null)" == "fq" ]] && \
+             { [[ "$write_bbr" == "0" ]] || [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; }; then
+            log "$result_label 已生效并通过持久化顺序验证，配置写入 $SYSCTL_TARGET。"
+            [[ -n "$backup_file" ]] && log "原配置备份：$backup_file"
+            return 0
+        fi
     fi
 
     if [[ "$target_existed" == "1" ]]; then
-        cp -a "$backup_file" "$SYSCTL_TARGET"
+        cp -a "$backup_file" "$SYSCTL_TARGET" || error "恢复 $SYSCTL_TARGET 失败，请使用备份 $backup_file 手动恢复。"
     else
         rm -f "$SYSCTL_TARGET"
     fi
@@ -315,24 +435,175 @@ check_os() {
         error "无法获取系统版本信息！"
         exit 1
     fi
+
+    if [[ "$OS_ID" != "debian" && "$OS_ID" != "ubuntu" ]]; then
+        error "当前系统 $OS_ID 不在支持范围内，仅支持 Debian 和 Ubuntu。"
+        exit 1
+    fi
+}
+
+check_dependencies() {
+    local command_name
+    local -a missing_commands=()
+    local -a required_commands=(
+        awk sed grep find readlink systemctl sysctl ip ss timeout getent
+        free df swapon swapoff mkswap timedatectl sshd
+    )
+
+    for command_name in "${required_commands[@]}"; do
+        command -v "$command_name" >/dev/null 2>&1 || missing_commands+=("$command_name")
+    done
+    if (( ${#missing_commands[@]} > 0 )); then
+        error "缺少必要命令：${missing_commands[*]}"
+        echo "请先安装 openssh-server、iproute2、procps、util-linux、coreutils 等基础软件包。"
+        exit 1
+    fi
 }
 
 # ==========================================
 # 辅助函数：安全重启 SSH 服务（兼容 Ubuntu 24.04+）
 # ==========================================
+ssh_unit_exists() {
+    systemctl cat "$1" >/dev/null 2>&1
+}
+
+begin_ssh_transaction() {
+    SSH_BACKUP_PATH="$BACKUP_DIR/ssh-$(date +%Y%m%d%H%M%S)-$$"
+    SSH_MANAGED_EXISTED=0
+    SSH_SOCKET_ENABLED=$(systemctl is-enabled ssh.socket 2>/dev/null || true)
+    SSH_SOCKET_ACTIVE=$(systemctl is-active ssh.socket 2>/dev/null || true)
+    SSH_SERVICE_ENABLED=$(systemctl is-enabled ssh.service 2>/dev/null || true)
+    SSH_SERVICE_ACTIVE=$(systemctl is-active ssh.service 2>/dev/null || true)
+
+    if [[ -L "$SSH_MANAGED_FILE" ]]; then
+        error "$SSH_MANAGED_FILE 是符号链接，为避免修改未知目标已停止操作。"
+        return 1
+    fi
+    mkdir -p "$SSH_BACKUP_PATH" "$(dirname "$SSH_MANAGED_FILE")" || return 1
+    cp -a /etc/ssh/sshd_config "$SSH_BACKUP_PATH/sshd_config" || return 1
+    if [[ -e "$SSH_MANAGED_FILE" || -L "$SSH_MANAGED_FILE" ]]; then
+        SSH_MANAGED_EXISTED=1
+        cp -a "$SSH_MANAGED_FILE" "$SSH_BACKUP_PATH/managed.conf" || return 1
+    fi
+}
+
+restore_unit_enablement() {
+    local unit="$1"
+    local state="$2"
+
+    ssh_unit_exists "$unit" || return 0
+    case "$state" in
+        masked|masked-runtime)
+            systemctl stop "$unit" >/dev/null 2>&1 || return 1
+            systemctl mask "$unit" >/dev/null 2>&1 || return 1
+            ;;
+        enabled|enabled-runtime)
+            systemctl unmask "$unit" >/dev/null 2>&1 || return 1
+            systemctl enable "$unit" >/dev/null 2>&1 || return 1
+            ;;
+        *)
+            systemctl unmask "$unit" >/dev/null 2>&1 || return 1
+            systemctl disable "$unit" >/dev/null 2>&1 || true
+            ;;
+    esac
+}
+
+restore_ssh_transaction() {
+    cp -a "$SSH_BACKUP_PATH/sshd_config" /etc/ssh/sshd_config || return 1
+    if [[ "$SSH_MANAGED_EXISTED" == "1" ]]; then
+        cp -a "$SSH_BACKUP_PATH/managed.conf" "$SSH_MANAGED_FILE" || return 1
+    else
+        rm -f "$SSH_MANAGED_FILE" || return 1
+    fi
+
+    systemctl stop ssh.service >/dev/null 2>&1 || true
+    systemctl stop ssh.socket >/dev/null 2>&1 || true
+    restore_unit_enablement ssh.service "$SSH_SERVICE_ENABLED" || return 1
+    restore_unit_enablement ssh.socket "$SSH_SOCKET_ENABLED" || return 1
+    systemctl daemon-reload >/dev/null 2>&1 || true
+
+    if [[ "$SSH_SOCKET_ACTIVE" == "active" ]] && ssh_unit_exists ssh.socket; then
+        systemctl start ssh.socket >/dev/null 2>&1 || return 1
+    fi
+    if [[ "$SSH_SERVICE_ACTIVE" == "active" ]]; then
+        systemctl start ssh.service >/dev/null 2>&1 || \
+            systemctl start ssh >/dev/null 2>&1 || \
+            systemctl start sshd >/dev/null 2>&1 || return 1
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || return 1
+}
+
+rollback_ssh_with_message() {
+    local message="$1"
+
+    if restore_ssh_transaction; then
+        error "$message，SSH 配置与 socket/service 状态已回滚。"
+    else
+        error "$message，自动回滚未完全成功，请从 $SSH_BACKUP_PATH 手动恢复。"
+    fi
+}
+
+ensure_ssh_managed_include() {
+    local temp_file
+
+    mkdir -p "$(dirname "$SSH_MANAGED_FILE")" || return 1
+    if ! grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf([[:space:]]|$)' /etc/ssh/sshd_config; then
+        temp_file=$(mktemp /etc/ssh/.vps-init-sshd.XXXXXX) || return 1
+        {
+            echo "Include /etc/ssh/sshd_config.d/*.conf"
+            cat /etc/ssh/sshd_config
+        } > "$temp_file" || {
+            rm -f "$temp_file"
+            return 1
+        }
+        chmod --reference=/etc/ssh/sshd_config "$temp_file" || {
+            rm -f "$temp_file"
+            return 1
+        }
+        chown --reference=/etc/ssh/sshd_config "$temp_file" || {
+            rm -f "$temp_file"
+            return 1
+        }
+        mv -f "$temp_file" /etc/ssh/sshd_config || return 1
+    fi
+    touch "$SSH_MANAGED_FILE" || return 1
+    chmod 600 "$SSH_MANAGED_FILE" || return 1
+}
+
+write_sshd_key() {
+    local key="$1"
+    local value="$2"
+
+    sed -i -E "/^[[:space:]]*${key}[[:space:]]+/Id" "$SSH_MANAGED_FILE" || return 1
+    printf '%s %s\n' "$key" "$value" >> "$SSH_MANAGED_FILE"
+}
+
+has_valid_root_authorized_key() {
+    local key_file="/root/.ssh/authorized_keys"
+
+    [[ -r "$key_file" ]] || return 1
+    if command -v ssh-keygen >/dev/null 2>&1; then
+        ssh-keygen -l -f "$key_file" >/dev/null 2>&1
+        return $?
+    fi
+    grep -Eq '(^|[[:space:]])(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp[0-9]+|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)[[:space:]]+[A-Za-z0-9+/]+={0,3}([[:space:]]|$)' "$key_file"
+}
+
 restart_ssh() {
     if [[ "$OS_ID" == "ubuntu" ]]; then
         UBUNTU_MAJOR="${OS_VERSION%%.*}"
         if [[ "$UBUNTU_MAJOR" =~ ^[0-9]+$ && "$UBUNTU_MAJOR" -ge 24 ]]; then
             # Ubuntu 24.04+ 必须切换到 ssh.service，socket 不重新监听新端口
-            systemctl stop ssh.socket 2>/dev/null
-            systemctl disable ssh.socket 2>/dev/null
-            systemctl mask ssh.socket >/dev/null 2>&1 || true
-            systemctl enable ssh.service 2>/dev/null
-            systemctl daemon-reload
+            if ssh_unit_exists ssh.socket; then
+                systemctl stop ssh.socket 2>/dev/null || return 1
+                systemctl disable ssh.socket 2>/dev/null || return 1
+                systemctl mask ssh.socket >/dev/null 2>&1 || return 1
+            fi
+            systemctl enable ssh.service >/dev/null 2>&1 || return 1
+            systemctl daemon-reload || return 1
             systemctl restart ssh.service
         else
-            systemctl daemon-reload
+            systemctl daemon-reload || return 1
             systemctl restart ssh.socket 2>/dev/null || systemctl restart ssh 2>/dev/null
         fi
     else
@@ -340,35 +611,186 @@ restart_ssh() {
     fi
 }
 
+begin_swap_transaction() {
+    SWAP_BACKUP_PATH="$BACKUP_DIR/swap-$(date +%Y%m%d%H%M%S)-$$"
+    SWAP_SYSCTL_EXISTED=0
+    SWAP_PREVIOUS_SWAPPINESS=$(sysctl -n vm.swappiness 2>/dev/null)
+
+    mkdir -p "$SWAP_BACKUP_PATH" "$(dirname "$SWAP_SYSCTL_FILE")" || return 1
+    cp -a /etc/fstab "$SWAP_BACKUP_PATH/fstab" || return 1
+    if [[ -e "$SWAP_SYSCTL_FILE" || -L "$SWAP_SYSCTL_FILE" ]]; then
+        if [[ -L "$SWAP_SYSCTL_FILE" ]]; then
+            error "$SWAP_SYSCTL_FILE 是符号链接，为避免修改未知目标已停止操作。"
+            return 1
+        fi
+        SWAP_SYSCTL_EXISTED=1
+        cp -a "$SWAP_SYSCTL_FILE" "$SWAP_BACKUP_PATH/swappiness.conf" || return 1
+    fi
+}
+
+restore_swap_persistence() {
+    cp -a "$SWAP_BACKUP_PATH/fstab" /etc/fstab || return 1
+    if [[ "$SWAP_SYSCTL_EXISTED" == "1" ]]; then
+        cp -a "$SWAP_BACKUP_PATH/swappiness.conf" "$SWAP_SYSCTL_FILE" || return 1
+    else
+        rm -f "$SWAP_SYSCTL_FILE" || return 1
+    fi
+    if [[ -n "$SWAP_PREVIOUS_SWAPPINESS" ]]; then
+        sysctl -w "vm.swappiness=$SWAP_PREVIOUS_SWAPPINESS" >/dev/null 2>&1 || true
+    fi
+}
+
+rollback_swap_creation() {
+    swapoff "$MANAGED_SWAP_FILE" >/dev/null 2>&1 || true
+    rm -f "$MANAGED_SWAP_FILE" >/dev/null 2>&1 || true
+    if ! restore_swap_persistence; then
+        error "SWAP 自动回滚未完全成功，请从 $SWAP_BACKUP_PATH 手动恢复。"
+    fi
+}
+
+create_managed_swap() {
+    local swap_size="$1"
+    local expected_bytes
+    local count_val
+    local actual_bytes
+    local fstab_temp
+
+    if command -v numfmt >/dev/null 2>&1; then
+        expected_bytes=$(numfmt --from=iec "$swap_size" 2>/dev/null) || return 1
+    else
+        local number="${swap_size//[^0-9]/}"
+        local unit="${swap_size//[0-9]/}"
+        if [[ "${unit^^}" == "G" ]]; then
+            expected_bytes=$((number * 1024 * 1024 * 1024))
+        else
+            expected_bytes=$((number * 1024 * 1024))
+        fi
+    fi
+    count_val=$((expected_bytes / 1048576))
+
+    if ! begin_swap_transaction; then
+        error "无法完成 SWAP 配置备份，未创建文件。"
+        return 1
+    fi
+
+    log "正在创建 $swap_size 的 SWAP 文件..."
+    if ! fallocate -l "$expected_bytes" "$MANAGED_SWAP_FILE" 2>/dev/null; then
+        rm -f "$MANAGED_SWAP_FILE"
+        log "当前文件系统不支持 fallocate，正在降级使用 dd 创建..."
+        if ! dd if=/dev/zero of="$MANAGED_SWAP_FILE" bs=1M count="$count_val" status=progress conv=fsync; then
+            error "dd 创建 SWAP 文件失败。"
+            rollback_swap_creation
+            return 1
+        fi
+    fi
+
+    actual_bytes=$(stat -c%s "$MANAGED_SWAP_FILE" 2>/dev/null)
+    if [[ "$actual_bytes" != "$expected_bytes" ]]; then
+        error "SWAP 文件大小校验失败：期望 $expected_bytes bytes，实际 ${actual_bytes:-未知}。"
+        rollback_swap_creation
+        return 1
+    fi
+    if ! chmod 600 "$MANAGED_SWAP_FILE" || \
+       ! mkswap "$MANAGED_SWAP_FILE" >/dev/null || \
+       ! swapon "$MANAGED_SWAP_FILE"; then
+        error "SWAP 初始化或启用失败。"
+        rollback_swap_creation
+        return 1
+    fi
+
+    fstab_temp=$(mktemp /etc/.vps-init-fstab.XXXXXX) || {
+        rollback_swap_creation
+        return 1
+    }
+    if ! cp -a /etc/fstab "$fstab_temp" || \
+       ! printf '%s none swap sw 0 0 # managed by vps-init\n' "$MANAGED_SWAP_FILE" >> "$fstab_temp" || \
+       ! mv -f "$fstab_temp" /etc/fstab; then
+        rm -f "$fstab_temp"
+        error "写入 /etc/fstab 失败。"
+        rollback_swap_creation
+        return 1
+    fi
+
+    touch "$SWAP_SYSCTL_FILE" || {
+        rollback_swap_creation
+        return 1
+    }
+    if ! write_sysctl_key "$SWAP_SYSCTL_FILE" vm.swappiness 10 || \
+       ! sysctl -w vm.swappiness=10 >/dev/null 2>&1 || \
+       [[ "$(sysctl -n vm.swappiness 2>/dev/null)" != "10" ]] || \
+       [[ "$(get_effective_sysctl_value vm.swappiness)" != "10" ]]; then
+        error "vm.swappiness 写入或持久化顺序验证失败。"
+        rollback_swap_creation
+        return 1
+    fi
+
+    log "SWAP 创建成功并通过持久化验证。备份：$SWAP_BACKUP_PATH"
+}
+
+remove_managed_swap() {
+    local was_active="$1"
+    local fstab_temp
+
+    if ! begin_swap_transaction; then
+        error "无法备份 SWAP 配置，未执行删除。"
+        return 1
+    fi
+    if [[ "$was_active" == "1" ]] && ! swapoff "$MANAGED_SWAP_FILE"; then
+        error "$MANAGED_SWAP_FILE 卸载失败，未修改持久化配置。"
+        return 1
+    fi
+
+    fstab_temp=$(mktemp /etc/.vps-init-fstab.XXXXXX) || {
+        [[ "$was_active" == "1" ]] && swapon "$MANAGED_SWAP_FILE" >/dev/null 2>&1 || true
+        return 1
+    }
+    if ! awk -v path="$MANAGED_SWAP_FILE" '!($1==path && $3=="swap")' /etc/fstab > "$fstab_temp" || \
+       ! chmod --reference=/etc/fstab "$fstab_temp" || \
+       ! chown --reference=/etc/fstab "$fstab_temp" || \
+       ! mv -f "$fstab_temp" /etc/fstab; then
+        rm -f "$fstab_temp"
+        restore_swap_persistence >/dev/null 2>&1 || true
+        [[ "$was_active" == "1" ]] && swapon "$MANAGED_SWAP_FILE" >/dev/null 2>&1 || true
+        error "fstab 更新失败，原配置已恢复。"
+        return 1
+    fi
+
+    if [[ -f "$MANAGED_SWAP_FILE" ]] && ! rm -f "$MANAGED_SWAP_FILE"; then
+        restore_swap_persistence >/dev/null 2>&1 || true
+        [[ "$was_active" == "1" ]] && swapon "$MANAGED_SWAP_FILE" >/dev/null 2>&1 || true
+        error "SWAP 文件删除失败，fstab 与运行状态已尝试恢复。"
+        return 1
+    fi
+
+    log "$MANAGED_SWAP_FILE 已安全删除；其他 SWAP 保持不变。备份：$SWAP_BACKUP_PATH"
+}
+
 # ==========================================
-# 模块一：三级菜单 A - SWAP 设置
+# 模块一：SWAP 配置
 # ==========================================
 submenu_swap() {
     while true; do
-        clear
-        echo "=================================="
-        echo "     --- 三级菜单：SWAP 设置 ---"
-        echo "=================================="
-        echo -e "当前 SWAP 状态："
+        print_header "SWAP 配置"
+        echo "当前状态："
         if swapon --show | grep -q "."; then
             swapon --show | awk 'NR>1 {print " - 路径: "$1" | 大小: "$3" | 已用: "$4}'
-            echo -e " - 合计：$(free -h | awk '/^Swap/{print $2" 总 / "$3" 已用"}')"
+            echo " - 合计：$(free -h | awk '/^Swap/{print $2" 总 / "$3" 已用"}')"
         else
             echo -e "${YELLOW} - 未配置任何 SWAP${NC}"
         fi
-        echo "----------------------------------"
-        echo "1. 快速添加 1GB SWAP"
-        echo "2. 快速添加 2GB SWAP"
-        echo -e "${GREEN}3. 手动输入 SWAP 大小 (MB/GB)${NC}"
-        echo -e "${RED}4. 卸载并删除现有 SWAP${NC}"
-        echo "0. 返回上一级菜单"
-        echo "=================================="
-        read -p "请输入选项 [0-4]: " choice_swap
+        echo -e "${DIM}--------------------------------------------------${NC}"
+        print_menu_item 1 "快速添加 1GB SWAP"
+        print_menu_item 2 "快速添加 2GB SWAP"
+        print_menu_item 3 "手动输入 SWAP 大小" "支持 MB/GB"
+        echo -e "  ${RED}4. [需确认] 删除脚本管理的 /swapfile${NC}"
+        echo -e "  ${DIM}0. 返回上一级${NC}"
+        echo -e "${CYAN}==================================================${NC}"
+        read -r -p "请输入选项 [0-4]: " choice_swap
 
         if [[ "$choice_swap" =~ ^[1-3]$ ]]; then
             if swapon --show | grep -q "." || awk '!/^#/ && $3=="swap"' /etc/fstab | grep -q "."; then
-                error "检测到已存在 SWAP 配置！请先使用选项 4 卸载现有 SWAP。"
-                read -p "按回车键继续..."; continue
+                error "检测到已存在 SWAP 配置！请先确认现有配置，脚本不会覆盖。"
+                pause_menu; continue
             fi
         fi
 
@@ -376,10 +798,10 @@ submenu_swap() {
             1) swap_size="1G" ;;
             2) swap_size="2G" ;;
             3)
-                read -p "请输入所需 SWAP 大小 (例如 512M 或 4G): " swap_size
-                if [[ ! "$swap_size" =~ ^[0-9]+[MGmg]$ ]]; then
-                    error "格式错误！请输入带有 M 或 G 单位的数字。"
-                    read -p "按回车键继续..."; continue
+                read -r -p "请输入所需 SWAP 大小 (例如 512M 或 4G): " swap_size
+                if [[ ! "$swap_size" =~ ^[1-9][0-9]*[MGmg]$ ]]; then
+                    error "格式错误！请输入带有 M 或 G 单位的正整数。"
+                    pause_menu; continue
                 fi
                 ;;
             4)
@@ -390,39 +812,12 @@ submenu_swap() {
 
                 if [[ "$SWAP_ACTIVE" == "0" && "$SWAP_CONFIGURED" == "0" ]]; then
                     error "未检测到由脚本管理的 $MANAGED_SWAP_FILE；其他 SWAP 分区或文件不会被删除。"
-                    read -p "按回车键继续..."; continue
+                    pause_menu; continue
                 fi
 
-                read -p "确认只卸载并删除 $MANAGED_SWAP_FILE 吗？其他 SWAP 将保留。[y/N]: " confirm_swap_remove
-                [[ "$confirm_swap_remove" != "y" && "$confirm_swap_remove" != "Y" ]] && continue
-
-                log "正在安全卸载并删除 $MANAGED_SWAP_FILE..."
-                if [[ "$SWAP_ACTIVE" == "1" ]] && ! swapoff "$MANAGED_SWAP_FILE"; then
-                    error "$MANAGED_SWAP_FILE 卸载失败，未修改 fstab，也未删除文件。"
-                    read -p "按回车键继续..."; continue
-                fi
-
-                mkdir -p "$BACKUP_DIR"
-                FSTAB_BACKUP="$BACKUP_DIR/fstab.$(date +%Y%m%d%H%M%S).bak"
-                cp -a /etc/fstab "$FSTAB_BACKUP"
-                FSTAB_TMP=$(mktemp /tmp/vps-init-fstab.XXXXXX)
-                if awk -v path="$MANAGED_SWAP_FILE" '!($1==path && $3=="swap")' /etc/fstab > "$FSTAB_TMP" && cat "$FSTAB_TMP" > /etc/fstab; then
-                    rm -f "$FSTAB_TMP"
-                else
-                    rm -f "$FSTAB_TMP"
-                    cp -a "$FSTAB_BACKUP" /etc/fstab
-                    [[ "$SWAP_ACTIVE" == "1" ]] && swapon "$MANAGED_SWAP_FILE" >/dev/null 2>&1 || true
-                    error "fstab 更新失败，已恢复原配置。"
-                    read -p "按回车键继续..."; continue
-                fi
-
-                if [[ -f "$MANAGED_SWAP_FILE" ]] && ! rm -f "$MANAGED_SWAP_FILE"; then
-                    error "SWAP 已卸载且 fstab 条目已移除，但文件删除失败：$MANAGED_SWAP_FILE"
-                    read -p "按回车键继续..."; continue
-                fi
-
-                log "$MANAGED_SWAP_FILE 已安全删除；其他 SWAP 配置保持不变。fstab 备份：$FSTAB_BACKUP"
-                read -p "按回车键继续..."; continue
+                confirm_action "确认只卸载并删除 $MANAGED_SWAP_FILE 吗？其他 SWAP 将保留。" || continue
+                remove_managed_swap "$SWAP_ACTIVE"
+                pause_menu; continue
                 ;;
             0) return ;;
             *) error "无效选项！"; sleep 1; continue ;;
@@ -431,84 +826,41 @@ submenu_swap() {
         if [[ "$choice_swap" =~ ^[1-3]$ ]]; then
             if [[ -e "$MANAGED_SWAP_FILE" ]]; then
                 error "$MANAGED_SWAP_FILE 已存在但未被识别为活动 SWAP，为避免覆盖未知文件已停止操作。"
-                read -p "按回车键继续..."; continue
+                pause_menu; continue
             fi
-            log "正在创建 $swap_size 的 SWAP 文件..."
-            
-            if command -v numfmt >/dev/null 2>&1; then
-                count_val=$(numfmt --from=iec "$swap_size" | awk '{printf "%d", $1/1048576}')
-            else
-                num="${swap_size//[^0-9]/}"
-                unit="${swap_size//[0-9]/}"
-                [[ "${unit^^}" == "G" ]] && count_val=$((num * 1024)) || count_val=$num
-            fi
-
-            if ! fallocate -l "$swap_size" "$MANAGED_SWAP_FILE" 2>/dev/null; then
-                log "当前文件系统不支持 fallocate，正在降级使用 dd 创建 (请耐心等待)..."
-                dd if=/dev/zero of="$MANAGED_SWAP_FILE" bs=1M count="$count_val" status=progress conv=fsync
-            fi
-            
-            if [[ ! -f "$MANAGED_SWAP_FILE" ]] || [[ $(stat -c%s "$MANAGED_SWAP_FILE") -lt 1048576 ]]; then
-                error "SWAP 文件创建失败，磁盘空间可能不足！"
-                rm -f "$MANAGED_SWAP_FILE"
-                read -p "按回车键继续..."; continue
-            fi
-
-            chmod 600 "$MANAGED_SWAP_FILE"
-            if ! mkswap "$MANAGED_SWAP_FILE" >/dev/null || ! swapon "$MANAGED_SWAP_FILE"; then
-                error "SWAP 初始化或启用失败，正在清理未完成文件。"
-                swapoff "$MANAGED_SWAP_FILE" >/dev/null 2>&1 || true
-                rm -f "$MANAGED_SWAP_FILE"
-                read -p "按回车键继续..."; continue
-            fi
-            awk -v path="$MANAGED_SWAP_FILE" '!/^[[:space:]]*#/ && $1==path && $3=="swap" {found=1} END {exit !found}' /etc/fstab || \
-                printf '%s none swap sw 0 0 # managed by vps-init\n' "$MANAGED_SWAP_FILE" >> /etc/fstab
-            
-            mkdir -p /etc/sysctl.d/
-            if grep -q "^vm.swappiness" "$SYSCTL_FILE" 2>/dev/null; then
-                sed -i 's/^vm.swappiness=.*/vm.swappiness=10/' "$SYSCTL_FILE"
-            else
-                echo "vm.swappiness=10" >> "$SYSCTL_FILE"
-            fi
-            sysctl --system >/dev/null 2>&1
-            
-            log "SWAP 创建成功！"
-            read -p "按回车键继续..."
+            create_managed_swap "$swap_size"
+            pause_menu
         fi
     done
 }
 
 # ==========================================
-# 模块一：三级菜单 B - 时区设置
+# 模块一：时间与时区配置
 # ==========================================
 submenu_timezone() {
     while true; do
-        clear
-        echo "=================================="
-        echo "     --- 三级菜单：时区设置 ---"
-        echo "=================================="
-        echo -e "当前系统时间与时区："
-        echo -e " - $(date "+%Y-%m-%d %H:%M:%S %Z")"
-        echo "----------------------------------"
-        echo "1. 设置为 Asia/Shanghai (北京时间)"
-        echo "2. 设置为 UTC (协调世界时)"
-        echo -e "${GREEN}3. 手动输入目标时区 (例如 America/New_York)${NC}"
-        echo "0. 返回上一级菜单"
-        echo "=================================="
-        read -p "请输入选项 [0-3]: " choice_tz
+        print_header "时间与时区配置"
+        echo -e "当前时间：${YELLOW}$(date "+%Y-%m-%d %H:%M:%S %Z")${NC}"
+        echo -e "${DIM}--------------------------------------------------${NC}"
+        print_menu_item 1 "设置为 Asia/Shanghai" "北京时间"
+        print_menu_item 2 "设置为 UTC" "协调世界时"
+        print_menu_item 3 "手动输入目标时区" "例如 America/New_York"
+        echo -e "  ${DIM}0. 返回上一级${NC}"
+        echo -e "${CYAN}==================================================${NC}"
+        read -r -p "请输入选项 [0-3]: " choice_tz
 
         case "$choice_tz" in
             1) target_tz="Asia/Shanghai" ;;
             2) target_tz="UTC" ;;
             3)
-                read -p "请输入标准的时区代码 (注意大小写): " target_tz
+                read -r -p "请输入标准的时区代码 (注意大小写): " target_tz
                 if [[ -z "$target_tz" ]]; then
                     error "时区不能为空！"
-                    read -p "按回车键继续..."; continue
+                    pause_menu; continue
                 fi
                 if ! timedatectl list-timezones | grep -qx "$target_tz"; then
                     error "无效的时区代码：$target_tz"
-                    read -p "按回车键继续..."; continue
+                    pause_menu; continue
                 fi
                 ;;
             0) return ;;
@@ -520,7 +872,7 @@ submenu_timezone() {
 
         if [[ "$(timedatectl show -p Timezone --value 2>/dev/null)" != "$target_tz" ]]; then
             error "时区设置失败！"
-            read -p "按回车键继续..."; continue
+            pause_menu; continue
         fi
 
         if [[ "$OS_ID" == "debian" ]]; then
@@ -536,7 +888,7 @@ submenu_timezone() {
         fi
 
         log "时区配置成功！当前时间：$(date "+%Y-%m-%d %H:%M:%S %Z")"
-        read -p "按回车键继续..."
+        pause_menu
     done
 }
 
@@ -545,16 +897,13 @@ submenu_timezone() {
 # ==========================================
 submenu_env() {
     while true; do
-        clear
-        echo "=================================="
-        echo "      1. 基础环境与系统优化"
-        echo "=================================="
-        echo "1. 更新软件包并清理旧内核 (严格区分大版本)"
-        echo -e "2. 配置或调整 SWAP 虚拟内存 ${GREEN}[进入三级菜单]${NC}"
-        echo -e "3. 配置系统时间与时区同步   ${GREEN}[进入三级菜单]${NC}"
-        echo "0. 返回主菜单"
-        echo "=================================="
-        read -p "请输入选项 [0-3]: " choice_env
+        print_header "系统维护"
+        print_menu_item 1 "更新软件包并清理旧内核" "按系统版本使用安全升级策略"
+        print_menu_item 2 "SWAP 配置" "›"
+        print_menu_item 3 "时间与时区配置" "›"
+        echo -e "  ${DIM}0. 返回主菜单${NC}"
+        echo -e "${CYAN}==================================================${NC}"
+        read -r -p "请输入选项 [0-3]: " choice_env
 
         case "$choice_env" in
             1) 
@@ -563,24 +912,24 @@ submenu_env() {
                 
                 if [[ "$OS_ID" == "debian" ]]; then
                     if [[ "$OS_VERSION" == "12" ]]; then
-                        apt-get update -y || { error "更新源失败！"; read -p "按回车键继续..."; continue; }
-                        apt-get full-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" || { error "系统升级失败！"; read -p "按回车键继续..."; continue; }
+                        apt-get update -y || { error "更新源失败！"; pause_menu; continue; }
+                        apt-get full-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" || { error "系统升级失败！"; pause_menu; continue; }
                         apt-get autoremove --purge -y && apt-get clean
                         dpkg -l | grep ^rc | awk '{print $2}' | xargs -r dpkg -P
                     elif [[ "$OS_VERSION" == "13" ]]; then
-                        apt update -y || { error "更新源失败！"; read -p "按回车键继续..."; continue; }
-                        apt full-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" || { error "系统升级失败！"; read -p "按回车键继续..."; continue; }
+                        apt update -y || { error "更新源失败！"; pause_menu; continue; }
+                        apt full-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" || { error "系统升级失败！"; pause_menu; continue; }
                         apt autoremove --purge -y && apt clean
                         dpkg -l | awk '/^rc/ {print $2}' | xargs -r apt-get purge -y
                     else
                         log "执行通用 Debian 更新策略..."
-                        apt-get update -y || { error "更新源失败！"; read -p "按回车键继续..."; continue; }
-                        apt-get full-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" || { error "系统升级失败！"; read -p "按回车键继续..."; continue; }
+                        apt-get update -y || { error "更新源失败！"; pause_menu; continue; }
+                        apt-get full-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" || { error "系统升级失败！"; pause_menu; continue; }
                         apt-get autoremove --purge -y && apt-get clean
                     fi
                 elif [[ "$OS_ID" == "ubuntu" ]]; then
-                    apt-get update -y || { error "更新源失败！"; read -p "按回车键继续..."; continue; }
-                    apt-get full-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" || { error "系统升级失败！"; read -p "按回车键继续..."; continue; }
+                    apt-get update -y || { error "更新源失败！"; pause_menu; continue; }
+                    apt-get full-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" || { error "系统升级失败！"; pause_menu; continue; }
                     apt-get autoremove --purge -y && apt-get clean
                 fi
                 log "系统更新与清理完成。"
@@ -588,7 +937,7 @@ submenu_env() {
                     echo -e "${YELLOW}检测到系统需要重启。请重启后再确认新内核和 BBR 是否完全生效。${NC}"
                     [[ -f /var/run/reboot-required.pkgs ]] && sed 's/^/ - /' /var/run/reboot-required.pkgs
                 fi
-                read -p "按回车键继续..." 
+                pause_menu
                 ;;
             2) submenu_swap ;;
             3) submenu_timezone ;;
@@ -599,126 +948,124 @@ submenu_env() {
 }
 
 # ==========================================
-# 模块二：三级菜单 C - SSH 安全设置
+# 模块二：SSH 安全设置
 # ==========================================
 submenu_ssh() {
     while true; do
-        clear
-        echo "=================================="
-        echo "   --- 三级菜单：SSH 安全设置 ---"
-        echo "=================================="
+        print_header "SSH 端口与登录设置"
         CURRENT_PORT=$(get_ssh_port)
         [[ -z "$CURRENT_PORT" ]] && CURRENT_PORT="未知"
         LISTENING_PORTS=$(get_listening_ssh_ports)
         [[ -z "$LISTENING_PORTS" ]] && LISTENING_PORTS="未检测到"
         
         PWD_AUTH=$(sshd -T 2>/dev/null | grep -i "^passwordauthentication " | awk '{print $2}')
-        [[ "$PWD_AUTH" == "yes" ]] && PWD_STATUS="${RED}已开启 (存在爆破风险)${NC}" || PWD_STATUS="${GREEN}已禁用 (安全)${NC}"
+        case "$PWD_AUTH" in
+            yes) PWD_STATUS="${RED}已开启（存在爆破风险）${NC}" ;;
+            no) PWD_STATUS="${GREEN}已禁用${NC}" ;;
+            *) PWD_STATUS="${YELLOW}未知（请先检查 sshd 配置）${NC}" ;;
+        esac
         
         echo -e "配置的 SSH 端口: ${YELLOW}$CURRENT_PORT${NC}"
         echo -e "实际监听端口:     ${YELLOW}$LISTENING_PORTS${NC}"
-        echo -e "密码登录状态:  $PWD_STATUS"
-        echo "----------------------------------"
-        echo "1. 更改 SSH 端口 (带冲突检测与自动回滚)"
-        echo "2. 强制启用密钥登录并禁用密码 (带严格验证与目录排雷)"
-        echo "0. 返回上一级菜单"
-        echo "=================================="
-        read -p "请输入选项 [0-2]: " choice_ssh
+        echo -e "密码登录状态:     $PWD_STATUS"
+        echo -e "${DIM}--------------------------------------------------${NC}"
+        print_menu_item 1 "修改 SSH 端口" "冲突检测、监听验证与完整回滚"
+        print_menu_item 2 "启用密钥登录并禁用密码" "验证公钥后应用"
+        echo -e "  ${DIM}0. 返回上一级${NC}"
+        echo -e "${CYAN}==================================================${NC}"
+        read -r -p "请输入选项 [0-2]: " choice_ssh
 
         case "$choice_ssh" in
             1)
-                read -p "请输入新的 SSH 端口号 (10000-65535): " new_port
+                read -r -p "请输入新的 SSH 端口号 (10000-65535): " new_port
                 if [[ ! "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 10000 ] || [ "$new_port" -gt 65535 ]; then
                     error "端口号无效！请输入 10000 到 65535 之间的纯数字。"
-                    read -p "按回车键继续..."; continue
+                    pause_menu; continue
                 fi
-                
+
+                if [[ "$new_port" == "$CURRENT_PORT" ]]; then
+                    log "SSH 当前已配置为端口 $new_port，无需修改。"
+                    pause_menu; continue
+                fi
                 if ss -tuln | grep -q ":$new_port "; then
                     error "端口 $new_port 已被占用，请更换端口！"
-                    read -p "按回车键继续..."; continue
+                    pause_menu; continue
                 fi
-                
-                log "正在备份并修改 SSH 端口..."
-                BACKUP_FILE="/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
-                cp /etc/ssh/sshd_config "$BACKUP_FILE"
-                
-                if [[ -d /etc/ssh/sshd_config.d/ ]]; then
-                    grep -rilE "^[[:space:]]*port[[:space:]]" /etc/ssh/sshd_config.d/ 2>/dev/null | xargs -r sed -i '/^[[:space:]]*[Pp]ort[[:space:]]/d'
+
+                log "正在备份 SSH 配置和服务状态..."
+                if ! begin_ssh_transaction; then
+                    error "SSH 备份失败，未修改任何配置。"
+                    pause_menu; continue
                 fi
-                
-                sed -i '/^#\?[[:space:]]*Port[[:space:]]/d' /etc/ssh/sshd_config
-                echo "Port $new_port" >> /etc/ssh/sshd_config
-                
-                if ! sshd -t 2>/dev/null; then
-                    error "sshd_config 语法检查未通过！正在自动回滚备份..."
-                    cp "$BACKUP_FILE" /etc/ssh/sshd_config
-                    read -p "按回车键继续..."; continue
+
+                if ! ensure_ssh_managed_include || ! write_sshd_key Port "$new_port"; then
+                    rollback_ssh_with_message "SSH 托管配置写入失败"
+                    pause_menu; continue
                 fi
-                
+
+                if ! sshd -t 2>/dev/null || [[ "$(get_ssh_port)" != "$new_port" ]]; then
+                    rollback_ssh_with_message "SSH 语法或生效配置验证失败"
+                    pause_menu; continue
+                fi
+
                 if ! restart_ssh; then
-                    error "SSH 服务重启失败！正在回滚配置..."
-                    cp "$BACKUP_FILE" /etc/ssh/sshd_config
-                    restart_ssh >/dev/null 2>&1
-                    read -p "按回车键继续..."; continue
+                    rollback_ssh_with_message "SSH 服务重启失败"
+                    pause_menu; continue
                 fi
-                
-                # 等待 sshd 完成监听
+
                 sleep 1
-                
-                # 验证新端口是否真正 accept
-                if ! timeout 3 bash -c "</dev/tcp/127.0.0.1/$new_port" 2>/dev/null; then
-                    error "端口 $new_port 验证失败！sshd 可能未正常监听，正在回滚..."
-                    cp "$BACKUP_FILE" /etc/ssh/sshd_config
-                    restart_ssh >/dev/null 2>&1
-                    read -p "按回车键继续..."; continue
-                fi
-                
-                sync_fail2ban_ssh_port "$new_port"
                 LISTENING_PORTS=$(get_listening_ssh_ports)
-                log "SSH 端口修改成功，当前实际监听：${LISTENING_PORTS:-未知}。"
-                echo -e "${YELLOW}请先在新终端使用端口 $new_port 登录成功，再关闭当前会话；同时确认云安全组和防火墙已放行。${NC}"
-                read -p "按回车键继续..."
+                if ! tr ',' '\n' <<< "$LISTENING_PORTS" | grep -Fxq "$new_port" || \
+                   ! timeout 3 bash -c "</dev/tcp/127.0.0.1/$new_port" 2>/dev/null; then
+                    rollback_ssh_with_message "端口 $new_port 未通过实际监听验证"
+                    pause_menu; continue
+                fi
+
+                sync_fail2ban_ssh_port "$new_port"
+                log "SSH 端口修改成功，当前实际监听：${LISTENING_PORTS:-未知}。备份：$SSH_BACKUP_PATH"
+                warn "请先在新终端使用端口 $new_port 登录成功，再关闭当前会话；同时确认云安全组和防火墙已放行。"
+                pause_menu
                 ;;
                 
             2)
-                if ! grep -qE "^(ssh-|ecdsa-|sk-)" /root/.ssh/authorized_keys 2>/dev/null; then
-                    error "检测失败！未发现有效格式的 SSH 公钥。"
+                if ! has_valid_root_authorized_key; then
+                    error "检测失败！未发现可由 ssh-keygen 识别的 root SSH 公钥。"
                     error "请先在本地终端执行 'ssh-copy-id -p 端口 root@IP' 上传公钥！"
-                    read -p "按回车键继续..."; continue
+                    pause_menu; continue
                 fi
-                
-                read -p "⚠️  已检测到有效公钥。确认禁用密码登录吗？[y/N]: " confirm
-                [[ "$confirm" != "y" && "$confirm" != "Y" ]] && continue
-                
-                log "正在备份并强制密钥登录..."
-                BACKUP_FILE="/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
-                cp /etc/ssh/sshd_config "$BACKUP_FILE"
-                
-                if [[ -d /etc/ssh/sshd_config.d/ ]]; then
-                    grep -rl "PasswordAuthentication" /etc/ssh/sshd_config.d/ 2>/dev/null | xargs -r sed -i '/^[[:space:]]*PasswordAuthentication[[:space:]]/d'
-                    grep -rl "PubkeyAuthentication" /etc/ssh/sshd_config.d/ 2>/dev/null | xargs -r sed -i '/^[[:space:]]*PubkeyAuthentication[[:space:]]/d'
+
+                confirm_action "已检测到有效公钥，确认禁用密码和键盘交互登录吗？" || continue
+
+                log "正在备份并配置密钥登录..."
+                if ! begin_ssh_transaction; then
+                    error "SSH 备份失败，未修改任何配置。"
+                    pause_menu; continue
                 fi
-                
-                sed -i '/^#\?[[:space:]]*PasswordAuthentication[[:space:]]/d' /etc/ssh/sshd_config
-                sed -i '/^#\?[[:space:]]*PubkeyAuthentication[[:space:]]/d' /etc/ssh/sshd_config
-                echo "PasswordAuthentication no" >> /etc/ssh/sshd_config
-                echo "PubkeyAuthentication yes" >> /etc/ssh/sshd_config
-                
-                if ! sshd -t 2>/dev/null; then
-                    error "sshd_config 语法检查未通过！正在自动回滚备份..."
-                    cp "$BACKUP_FILE" /etc/ssh/sshd_config
-                    read -p "按回车键继续..."; continue
+
+                if ! ensure_ssh_managed_include || \
+                   ! write_sshd_key PubkeyAuthentication yes || \
+                   ! write_sshd_key PasswordAuthentication no || \
+                   ! write_sshd_key KbdInteractiveAuthentication no || \
+                   ! write_sshd_key ChallengeResponseAuthentication no; then
+                    rollback_ssh_with_message "SSH 登录配置写入失败"
+                    pause_menu; continue
                 fi
-                
+
+                if ! sshd -t 2>/dev/null || \
+                   [[ "$(sshd -T 2>/dev/null | awk '/^pubkeyauthentication /{print $2; exit}')" != "yes" ]] || \
+                   [[ "$(sshd -T 2>/dev/null | awk '/^passwordauthentication /{print $2; exit}')" != "no" ]] || \
+                   [[ "$(sshd -T 2>/dev/null | awk '/^kbdinteractiveauthentication /{print $2; exit}')" != "no" ]]; then
+                    rollback_ssh_with_message "SSH 登录配置验证失败"
+                    pause_menu; continue
+                fi
+
                 if ! restart_ssh; then
-                    error "SSH 服务重启失败！正在回滚配置..."
-                    cp "$BACKUP_FILE" /etc/ssh/sshd_config
-                    restart_ssh >/dev/null 2>&1
-                    read -p "按回车键继续..."; continue
+                    rollback_ssh_with_message "SSH 服务重启失败"
+                    pause_menu; continue
                 fi
-                
-                log "密码登录已成功禁用，大门已焊死！"
-                read -p "按回车键继续..."
+
+                log "密钥登录已启用，密码与键盘交互登录已禁用。备份：$SSH_BACKUP_PATH"
+                pause_menu
                 ;;
                 
             0) return ;;
@@ -732,23 +1079,20 @@ submenu_ssh() {
 # ==========================================
 submenu_sec() {
     while true; do
-        clear
-        echo "=================================="
-        echo "      2. 系统安全与防护"
-        echo "=================================="
-        echo -e "1. SSH 端口与登录防护设置 ${GREEN}[进入三级菜单]${NC}"
-        echo "2. 一键部署 Fail2ban 防爆破系统"
-        echo "0. 返回主菜单"
-        echo "=================================="
-        read -p "请输入选项 [0-2]: " choice_sec
+        print_header "SSH 与安全"
+        print_menu_item 1 "SSH 端口与登录设置" "›"
+        print_menu_item 2 "安装或更新 Fail2ban" "SSH 防爆破"
+        echo -e "  ${DIM}0. 返回主菜单${NC}"
+        echo -e "${CYAN}==================================================${NC}"
+        read -r -p "请输入选项 [0-2]: " choice_sec
 
         case "$choice_sec" in
             1) submenu_ssh ;;
             2) 
                 export DEBIAN_FRONTEND=noninteractive
                 echo -e "${YELLOW}正在更新源并安装 Fail2ban，请稍候...${NC}"
-                apt-get update -y >/dev/null 2>&1 || { error "源更新失败，请检查网络！"; read -p "按回车键继续..."; continue; }
-                apt-get install fail2ban -y >/dev/null 2>&1 || { error "Fail2ban 安装失败！"; read -p "按回车键继续..."; continue; }
+                apt-get update -y >/dev/null 2>&1 || { error "源更新失败，请检查网络！"; pause_menu; continue; }
+                apt-get install fail2ban -y >/dev/null 2>&1 || { error "Fail2ban 安装失败！"; pause_menu; continue; }
                 
                 log "正在配置防爆破规则..."
                 CURRENT_PORT=$(get_ssh_port)
@@ -775,11 +1119,11 @@ maxretry = 5
 findtime = 3600
 bantime  = 86400
 EOF
-                systemctl restart fail2ban || { error "Fail2ban 启动失败，请检查配置文件！"; read -p "按回车键继续..."; continue; }
+                systemctl restart fail2ban || { error "Fail2ban 启动失败，请检查配置文件！"; pause_menu; continue; }
                 systemctl enable fail2ban >/dev/null 2>&1
                 
                 log "Fail2ban 部署完成，当前已自动监听 $CURRENT_PORT 端口。"
-                read -p "按回车键继续..." 
+                pause_menu
                 ;;
             0) return ;;
             *) error "无效输入！"; sleep 1; continue ;;
@@ -788,13 +1132,20 @@ EOF
 }
 
 # ==========================================
-# 模块三：三级菜单 D - DNS 设置
+# 模块三：DNS 设置
 # ==========================================
 show_dns_status() {
+    local dns_output
+
     if systemctl is-active systemd-resolved >/dev/null 2>&1 && command -v resolvectl >/dev/null 2>&1; then
-        resolvectl dns 2>/dev/null | sed 's/^/ - /'
+        dns_output=$(resolvectl dns 2>/dev/null)
     else
-        grep -E '^[[:space:]]*nameserver[[:space:]]+' /etc/resolv.conf 2>/dev/null | awk '{print " - "$2}'
+        dns_output=$(grep -E '^[[:space:]]*nameserver[[:space:]]+' /etc/resolv.conf 2>/dev/null | awk '{print $2}')
+    fi
+    if [[ -n "$dns_output" ]]; then
+        sed 's/^/ - /' <<< "$dns_output"
+    else
+        echo -e " - ${YELLOW}未检测到有效 DNS 状态${NC}"
     fi
 }
 
@@ -872,10 +1223,10 @@ restore_dns_files() {
     done
 
     if [[ "$DNS_NETPLAN_APPLIED" == "1" ]] && command -v netplan >/dev/null 2>&1; then
-        netplan generate >/dev/null 2>&1 && netplan apply >/dev/null 2>&1 || true
+        netplan generate >/dev/null 2>&1 && timeout 30 netplan apply >/dev/null 2>&1 || true
     fi
     if [[ "$DNS_RESOLVED_ACTIVE" == "1" ]]; then
-        systemctl restart systemd-resolved >/dev/null 2>&1 || true
+        timeout 30 systemctl restart systemd-resolved >/dev/null 2>&1 || true
     fi
     [[ "$DNS_RESOLV_WAS_IMMUTABLE" == "1" ]] && chattr +i /etc/resolv.conf >/dev/null 2>&1 || true
 }
@@ -964,18 +1315,31 @@ EOF
     chmod 600 "$override_file" || return 1
     DNS_NETPLAN_APPLIED=1
     netplan generate >/dev/null 2>&1 || return 1
-    netplan apply >/dev/null 2>&1 || return 1
+    timeout 30 netplan apply >/dev/null 2>&1 || return 1
     log "已通过 netplan 为 $default_iface 同步 DNS。"
 }
 
 verify_dns_change() {
     local route_after
 
-    if [[ -n "$DNS_DEFAULT_ROUTE_BEFORE" ]]; then
-        route_after=$(ip route show default 2>/dev/null; ip -6 route show default 2>/dev/null)
+    if [[ -n "$DNS_DEFAULT_V4_IFACE_BEFORE" ]]; then
+        route_after=$(ip -o -4 route show default dev "$DNS_DEFAULT_V4_IFACE_BEFORE" 2>/dev/null)
         [[ -n "$route_after" ]] || return 1
+        if [[ -n "$DNS_DEFAULT_V4_GATEWAY_BEFORE" ]] && \
+           ! grep -Fq "via $DNS_DEFAULT_V4_GATEWAY_BEFORE " <<< "$route_after"; then
+            return 1
+        fi
     fi
-    getent ahosts github.com >/dev/null 2>&1 || getent ahosts cloudflare.com >/dev/null 2>&1
+    if [[ -n "$DNS_DEFAULT_V6_IFACE_BEFORE" ]]; then
+        route_after=$(ip -o -6 route show default dev "$DNS_DEFAULT_V6_IFACE_BEFORE" 2>/dev/null)
+        [[ -n "$route_after" ]] || return 1
+        if [[ -n "$DNS_DEFAULT_V6_GATEWAY_BEFORE" ]] && \
+           ! grep -Fq "via $DNS_DEFAULT_V6_GATEWAY_BEFORE " <<< "$route_after"; then
+            return 1
+        fi
+    fi
+    timeout 10 getent ahosts github.com >/dev/null 2>&1 || \
+        timeout 10 getent ahosts cloudflare.com >/dev/null 2>&1
 }
 
 apply_dns_servers() {
@@ -995,7 +1359,10 @@ apply_dns_servers() {
     DNS_BACKUP_FILES=()
     DNS_FILE_EXISTED=()
     DNS_BACKUP_PATH="$BACKUP_DIR/dns-$(date +%Y%m%d%H%M%S)-$$"
-    DNS_DEFAULT_ROUTE_BEFORE=$(ip route show default 2>/dev/null; ip -6 route show default 2>/dev/null)
+    DNS_DEFAULT_V4_IFACE_BEFORE=$(ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}')
+    DNS_DEFAULT_V4_GATEWAY_BEFORE=$(ip -o -4 route show default 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="via") {print $(i+1); exit}}')
+    DNS_DEFAULT_V6_IFACE_BEFORE=$(ip -o -6 route show default 2>/dev/null | awk '{print $5; exit}')
+    DNS_DEFAULT_V6_GATEWAY_BEFORE=$(ip -o -6 route show default 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="via") {print $(i+1); exit}}')
     DNS_NETPLAN_APPLIED=0
     DNS_RESOLVED_ACTIVE=0
     DNS_RESOLV_WAS_IMMUTABLE=0
@@ -1022,7 +1389,7 @@ apply_dns_servers() {
 DNS=$dns_line
 FallbackDNS=
 EOF
-        if ! systemctl restart systemd-resolved; then
+        if ! timeout 30 systemctl restart systemd-resolved; then
             error "systemd-resolved 重启失败，正在回滚 DNS。"
             restore_dns_files
             return 1
@@ -1063,19 +1430,16 @@ EOF
 
 submenu_dns() {
     while true; do
-        clear
-        echo "=================================="
-        echo "      --- 三级菜单：DNS 设置 ---"
-        echo "=================================="
+        print_header "DNS 配置"
         echo "当前生效 DNS 配置："
         show_dns_status
-        echo "----------------------------------"
-        echo "1. 快速设置为 Cloudflare (IPv4 + IPv6)"
-        echo "2. 快速设置为 Google (8.8.8.8 / 8.8.4.4)"
-        echo -e "${GREEN}3. 手动输入自定义 DNS 地址 (支持 IPv4/IPv6)${NC}"
-        echo "0. 返回上一级菜单"
-        echo "=================================="
-        read -p "请输入选项 [0-3]: " choice_dns
+        echo -e "${DIM}--------------------------------------------------${NC}"
+        print_menu_item 1 "设置为 Cloudflare" "IPv4 + 可用时的 IPv6"
+        print_menu_item 2 "设置为 Google" "8.8.8.8 / 8.8.4.4"
+        print_menu_item 3 "输入自定义 DNS" "支持 IPv4/IPv6"
+        echo -e "  ${DIM}0. 返回上一级${NC}"
+        echo -e "${CYAN}==================================================${NC}"
+        read -r -p "请输入选项 [0-3]: " choice_dns
 
         IPV6_STATUS=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
         DNS_ENTRY=""
@@ -1091,18 +1455,18 @@ submenu_dns() {
                 ;;
             2) DNS_ENTRY="8.8.8.8 8.8.4.4" ;;
             3)
-                read -p "请输入首选 DNS 地址: " dns1
-                read -p "请输入备用 DNS 地址 (留空则不设置): " dns2
+                read -r -p "请输入首选 DNS 地址: " dns1
+                read -r -p "请输入备用 DNS 地址 (留空则不设置): " dns2
                 
                 if [[ -z "$dns1" ]]; then
                     error "首选 DNS 不能为空！"
-                    read -p "按回车键继续..."; continue
+                    pause_menu; continue
                 fi
 
                 if [[ "$IPV6_STATUS" == "1" ]]; then
                     if [[ "$dns1" =~ ":" ]] || [[ "$dns2" =~ ":" ]]; then
                         error "当前系统已禁用 IPv6，无法配置 IPv6 格式的 DNS 解析！"
-                        read -p "按回车键继续..."; continue
+                        pause_menu; continue
                     fi
                 fi
                 DNS_ENTRY="$dns1"
@@ -1115,77 +1479,186 @@ submenu_dns() {
         log "正在配置 DNS..."
         if ! apply_dns_servers "$DNS_ENTRY"; then
             error "DNS 配置未能完全应用，请根据日志检查网络配置。"
-            read -p "按回车键继续..."; continue
+            pause_menu; continue
         fi
         
         sleep 1
         log "DNS 修改成功！"
         echo "当前检测到的 DNS："
         show_dns_status
-        read -p "按回车键继续..."
+        pause_menu
     done
 }
 
+configure_ip_preference() {
+    local mode="$1"
+    local backup_path="$BACKUP_DIR/gai-$(date +%Y%m%d%H%M%S)-$$"
+    local gai_existed=0
+
+    mkdir -p "$backup_path" || return 1
+    if [[ -L /etc/gai.conf ]]; then
+        error "/etc/gai.conf 是符号链接，为避免修改未知目标已停止操作。"
+        return 1
+    fi
+    if [[ -f /etc/gai.conf ]]; then
+        gai_existed=1
+        cp -a /etc/gai.conf "$backup_path/gai.conf" || return 1
+    else
+        touch /etc/gai.conf || return 1
+    fi
+
+    if ! sed -i -E '/^[[:space:]]*precedence[[:space:]]+::ffff:0:0\/96[[:space:]]+/d' /etc/gai.conf; then
+        error "gai.conf 更新失败。"
+    elif [[ "$mode" == "ipv4" ]] && \
+         ! printf '%s\n' "precedence ::ffff:0:0/96  100" >> /etc/gai.conf; then
+        error "IPv4 优先级写入失败。"
+    elif [[ "$mode" == "ipv4" ]] && \
+         ! grep -qE '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100([[:space:]]|$)' /etc/gai.conf; then
+        error "IPv4 优先级验证失败。"
+    elif [[ "$mode" == "default" ]] && \
+         grep -qE '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+' /etc/gai.conf; then
+        error "默认地址优先级恢复验证失败。"
+    else
+        log "地址优先级已更新。备份：$backup_path"
+        return 0
+    fi
+
+    if [[ "$gai_existed" == "1" ]]; then
+        cp -a "$backup_path/gai.conf" /etc/gai.conf || true
+    else
+        rm -f /etc/gai.conf || true
+    fi
+    return 1
+}
+
+restore_ipv6_transaction() {
+    local index
+
+    if [[ "$IPV6_FILE_EXISTED" == "1" ]]; then
+        cp -a "$IPV6_BACKUP_PATH/ipv6.conf" "$IPV6_SYSCTL_FILE" || return 1
+    else
+        rm -f "$IPV6_SYSCTL_FILE" || return 1
+    fi
+    for index in "${!IPV6_RUNTIME_PATHS[@]}"; do
+        printf '%s' "${IPV6_RUNTIME_VALUES[$index]}" > "${IPV6_RUNTIME_PATHS[$index]}" 2>/dev/null || true
+    done
+}
+
+configure_ipv6_state() {
+    local target_value="$1"
+    local action_label="禁用"
+    local runtime_path
+    local runtime_value
+
+    [[ "$target_value" == "0" ]] && action_label="启用"
+    IPV6_BACKUP_PATH="$BACKUP_DIR/ipv6-$(date +%Y%m%d%H%M%S)-$$"
+    IPV6_FILE_EXISTED=0
+    IPV6_RUNTIME_PATHS=()
+    IPV6_RUNTIME_VALUES=()
+    IPV6_PREVIOUS_ALL=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
+    IPV6_PREVIOUS_DEFAULT=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null)
+    IPV6_PREVIOUS_LO=$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null)
+
+    for runtime_path in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+        [[ -r "$runtime_path" ]] || continue
+        runtime_value=$(<"$runtime_path")
+        IPV6_RUNTIME_PATHS+=("$runtime_path")
+        IPV6_RUNTIME_VALUES+=("$runtime_value")
+    done
+
+    if [[ -z "$IPV6_PREVIOUS_ALL" || -z "$IPV6_PREVIOUS_DEFAULT" || -z "$IPV6_PREVIOUS_LO" ]] || \
+       (( ${#IPV6_RUNTIME_PATHS[@]} == 0 )); then
+        error "无法读取当前 IPv6 内核状态，未修改配置。"
+        return 1
+    fi
+    if [[ -L "$IPV6_SYSCTL_FILE" ]]; then
+        error "$IPV6_SYSCTL_FILE 是符号链接，为避免修改未知目标已停止操作。"
+        return 1
+    fi
+    mkdir -p "$IPV6_BACKUP_PATH" "$(dirname "$IPV6_SYSCTL_FILE")" || return 1
+    if [[ -f "$IPV6_SYSCTL_FILE" ]]; then
+        IPV6_FILE_EXISTED=1
+        cp -a "$IPV6_SYSCTL_FILE" "$IPV6_BACKUP_PATH/ipv6.conf" || return 1
+    else
+        touch "$IPV6_SYSCTL_FILE" || return 1
+    fi
+
+    if ! write_sysctl_key "$IPV6_SYSCTL_FILE" net.ipv6.conf.all.disable_ipv6 "$target_value" || \
+       ! write_sysctl_key "$IPV6_SYSCTL_FILE" net.ipv6.conf.default.disable_ipv6 "$target_value" || \
+       ! write_sysctl_key "$IPV6_SYSCTL_FILE" net.ipv6.conf.lo.disable_ipv6 "$target_value" || \
+       [[ "$(get_effective_sysctl_value net.ipv6.conf.all.disable_ipv6)" != "$target_value" ]] || \
+       [[ "$(get_effective_sysctl_value net.ipv6.conf.default.disable_ipv6)" != "$target_value" ]] || \
+       [[ "$(get_effective_sysctl_value net.ipv6.conf.lo.disable_ipv6)" != "$target_value" ]] || \
+       ! sysctl -w "net.ipv6.conf.all.disable_ipv6=$target_value" >/dev/null 2>&1 || \
+       ! sysctl -w "net.ipv6.conf.default.disable_ipv6=$target_value" >/dev/null 2>&1 || \
+       ! sysctl -w "net.ipv6.conf.lo.disable_ipv6=$target_value" >/dev/null 2>&1 || \
+       [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" != "$target_value" ]] || \
+       [[ "$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null)" != "$target_value" ]] || \
+       [[ "$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null)" != "$target_value" ]]; then
+        if restore_ipv6_transaction; then
+            error "IPv6 $action_label失败，配置文件与运行参数已回滚。"
+        else
+            error "IPv6 $action_label失败且自动回滚不完整，请从 $IPV6_BACKUP_PATH 手动恢复。"
+        fi
+        return 1
+    fi
+
+    log "IPv6 已$action_label并通过运行状态和持久化验证。备份：$IPV6_BACKUP_PATH"
+}
+
 # ==========================================
-# 模块三：三级菜单 E - IPv6 优先级
+# 模块三：IPv6 优先级
 # ==========================================
 submenu_ipv6() {
     while true; do
-        clear
-        echo "=================================="
-        echo "   --- 三级菜单：IPv6 优先级 ---"
-        echo "=================================="
+        print_header "IPv4 / IPv6 配置"
         IPV6_STATUS=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
+        case "$IPV6_STATUS" in
+            1) echo -e "当前 IPv6 状态: ${RED}已禁用${NC}" ;;
+            0)
+                echo -e "当前 IPv6 状态: ${GREEN}已启用${NC}"
+                if grep -qE '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100([[:space:]]|$)' /etc/gai.conf 2>/dev/null; then
+                    echo -e "当前地址优先级:   ${YELLOW}IPv4 优先${NC}"
+                else
+                    echo -e "当前地址优先级:   ${GREEN}系统默认${NC}"
+                fi
+                ;;
+            *)
+                echo -e "当前 IPv6 状态: ${YELLOW}未知（内核参数读取失败）${NC}"
+                ;;
+        esac
         if [[ "$IPV6_STATUS" == "1" ]]; then
-            echo -e "当前 IPv6 状态: ${RED}已禁用${NC}"
-        else
-            echo -e "当前 IPv6 状态: ${GREEN}已启用${NC}"
-            if grep -q "^precedence ::ffff:0:0/96" /etc/gai.conf 2>/dev/null; then
+            if grep -qE '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100([[:space:]]|$)' /etc/gai.conf 2>/dev/null; then
                 echo -e "当前路由优先:   ${YELLOW}IPv4 优先${NC}"
             else
-                echo -e "当前路由优先:   ${GREEN}系统默认 (通常为 IPv6 优先)${NC}"
+                echo -e "当前地址优先级:   ${DIM}系统默认${NC}"
             fi
         fi
-        echo "----------------------------------"
-        echo "1. 强制优先使用 IPv4 (解决双栈机器访问过慢、卡顿)"
-        echo "2. 恢复系统默认路由优先级"
-        echo -e "${RED}3. 彻底禁用系统 IPv6 功能${NC}"
-        echo -e "${GREEN}4. 重新启用系统 IPv6 功能${NC}"
-        echo "0. 返回上一级菜单"
-        echo "=================================="
-        read -p "请输入选项 [0-4]: " choice_ipv6
-
-        touch /etc/gai.conf 2>/dev/null
+        echo -e "${DIM}--------------------------------------------------${NC}"
+        print_menu_item 1 "优先使用 IPv4" "保留 IPv6"
+        print_menu_item 2 "恢复系统默认地址优先级"
+        echo -e "  ${RED}3. [需确认] 禁用系统 IPv6${NC}"
+        print_menu_item 4 "重新启用系统 IPv6"
+        echo -e "  ${DIM}0. 返回上一级${NC}"
+        echo -e "${CYAN}==================================================${NC}"
+        read -r -p "请输入选项 [0-4]: " choice_ipv6
 
         case "$choice_ipv6" in
             1)
                 log "正在设置 IPv4 优先..."
-                sed -i '/^precedence ::ffff:0:0\/96/d' /etc/gai.conf
-                echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
-                log "IPv4 优先级提升成功。"
-                read -p "按回车键继续..." ;;
+                configure_ip_preference ipv4
+                pause_menu ;;
             2)
                 log "正在恢复默认路由优先级..."
-                sed -i '/^precedence ::ffff:0:0\/96/d' /etc/gai.conf
-                log "路由优先级已恢复系统默认。"
-                read -p "按回车键继续..." ;;
-            3|4)
-                local target_val=1
-                [[ "$choice_ipv6" == "4" ]] && target_val=0
-                local action_msg=$([[ "$target_val" == 1 ]] && echo "禁用" || echo "启用")
-                
-                log "正在$action_msg IPv6..."
-                sed -i '/^net.ipv6.conf.all.disable_ipv6/d' /etc/sysctl.conf
-                sed -i '/^net.ipv6.conf.default.disable_ipv6/d' /etc/sysctl.conf
-                sed -i '/^net.ipv6.conf.lo.disable_ipv6/d' /etc/sysctl.conf
-
-                echo "net.ipv6.conf.all.disable_ipv6 = $target_val" >> /etc/sysctl.conf
-                echo "net.ipv6.conf.default.disable_ipv6 = $target_val" >> /etc/sysctl.conf
-                echo "net.ipv6.conf.lo.disable_ipv6 = $target_val" >> /etc/sysctl.conf
-                sysctl -p >/dev/null 2>&1
-                
-                log "系统 IPv6 已$action_msg。部分接口（如 lo）可能需要重启服务器后才能完全生效。"
-                read -p "按回车键继续..." ;;
+                configure_ip_preference default
+                pause_menu ;;
+            3)
+                confirm_action "禁用 IPv6 可能影响仅提供 IPv6 的服务，确认继续吗？" || continue
+                configure_ipv6_state 1
+                pause_menu ;;
+            4)
+                configure_ipv6_state 0
+                pause_menu ;;
             0) return ;;
             *) error "无效选项！"; sleep 1; continue ;;
         esac
@@ -1193,25 +1666,24 @@ submenu_ipv6() {
 }
 
 # ==========================================
-# 模块三：二级菜单 - 网络与内核优化
+# 模块三：网络配置
 # ==========================================
 submenu_net() {
     while true; do
-        clear
-        echo "=================================="
-        echo "      3. 网络与内核优化"
-        echo "=================================="
+        print_header "网络配置"
         CURRENT_BBR=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
         [[ -z "$CURRENT_BBR" ]] && CURRENT_BBR="未知"
+        CURRENT_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+        [[ -z "$CURRENT_QDISC" ]] && CURRENT_QDISC="未知"
         
-        echo -e "当前拥塞控制算法: ${YELLOW}$CURRENT_BBR${NC}"
-        echo "----------------------------------"
-        echo "1. 一键开启 BBR 拥塞控制与 FQ 队列"
-        echo -e "2. 配置系统 DNS 解析服务器   ${GREEN}[进入三级菜单]${NC}"
-        echo -e "3. 调整 IPv4/IPv6 路由优先级 ${GREEN}[进入三级菜单]${NC}"
-        echo "0. 返回主菜单"
-        echo "=================================="
-        read -p "请输入选项 [0-3]: " choice_net
+        echo -e "拥塞控制 / 队列: ${YELLOW}$CURRENT_BBR / $CURRENT_QDISC${NC}"
+        echo -e "${DIM}--------------------------------------------------${NC}"
+        print_menu_item 1 "配置 BBR 与 FQ"
+        print_menu_item 2 "DNS 配置" "›"
+        print_menu_item 3 "IPv4 / IPv6 配置" "›"
+        echo -e "  ${DIM}0. 返回主菜单${NC}"
+        echo -e "${CYAN}==================================================${NC}"
+        read -r -p "请输入选项 [0-3]: " choice_net
 
         case "$choice_net" in
             1) 
@@ -1220,25 +1692,25 @@ submenu_net() {
 
                 if [[ "$CURRENT_CC" == "bbr" && "$CURRENT_QDISC" == "fq" ]]; then
                     log "BBR 与 FQ 当前均已开启，不创建或修改任何 sysctl 文件。"
-                    read -p "按回车键继续..."; continue
+                    pause_menu; continue
                 fi
 
                 if [[ "$CURRENT_CC" == "bbr" ]]; then
                     echo -e "${YELLOW}BBR 已开启，但当前默认队列为 ${CURRENT_QDISC:-未知}，不是 fq。${NC}"
-                    read -p "是否只补充并启用 FQ？[y/N]: " confirm_fq
+                    read -r -p "是否只补充并启用 FQ？[y/N]: " confirm_fq
                     if [[ "$confirm_fq" == "y" || "$confirm_fq" == "Y" ]]; then
                         persist_bbr_settings "$CURRENT_CC" "$CURRENT_QDISC" 0
                     else
                         log "已保留当前 BBR 与队列配置。"
                     fi
-                    read -p "按回车键继续..."; continue
+                    pause_menu; continue
                 fi
 
                 K_MAJOR=$(uname -r | cut -d. -f1)
                 K_MINOR=$(uname -r | cut -d. -f2)
                 if [[ "$K_MAJOR" -lt 4 ]] || [[ "$K_MAJOR" -eq 4 && "$K_MINOR" -lt 9 ]]; then
                     error "当前内核版本 $(uname -r) 过低，BBR 需要 4.9 或以上版本！"
-                    read -p "按回车键继续..."; continue
+                    pause_menu; continue
                 fi
                 
                 log "正在根据当前内核的实际能力检测并配置 BBR..."
@@ -1246,11 +1718,11 @@ submenu_net() {
                 
                 if ! grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
                     error "当前内核未包含 BBR 支持，开启失败！"
-                    read -p "按回车键继续..."; continue
+                    pause_menu; continue
                 fi
                 
                 persist_bbr_settings "$CURRENT_CC" "$CURRENT_QDISC" 1
-                read -p "按回车键继续..." 
+                pause_menu
                 ;;
             2) submenu_dns ;;
             3) submenu_ipv6 ;;
@@ -1267,47 +1739,146 @@ show_status_summary() {
     local ssh_port
     local listening_ports
     local password_auth
+    local password_display
     local ipv6_disabled
     local ip_preference
     local fail2ban_status
+    local current_cc
+    local current_qdisc
+    local persistent_cc
+    local persistent_qdisc
+    local persistence_file="未检测到"
 
     ssh_port=$(get_ssh_port)
     listening_ports=$(get_listening_ssh_ports)
     password_auth=$(sshd -T 2>/dev/null | awk '/^passwordauthentication /{print $2; exit}')
     ipv6_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
-    if [[ "$ipv6_disabled" == "1" ]]; then
-        ip_preference="IPv6 已禁用"
-    elif grep -q '^precedence ::ffff:0:0/96' /etc/gai.conf 2>/dev/null; then
-        ip_preference="IPv4 优先"
-    else
-        ip_preference="系统默认"
-    fi
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    persistent_cc=$(get_effective_sysctl_value net.ipv4.tcp_congestion_control)
+    persistent_qdisc=$(get_effective_sysctl_value net.core.default_qdisc)
+    scan_sysctl_configs
+    [[ -n "$LAST_EFFECTIVE_KEY_FILE" ]] && persistence_file="$LAST_EFFECTIVE_KEY_FILE"
+
+    case "$password_auth" in
+        yes) password_display="${RED}已启用${NC}" ;;
+        no) password_display="${GREEN}已禁用${NC}" ;;
+        *) password_display="${YELLOW}未知${NC}" ;;
+    esac
+    case "$ipv6_disabled" in
+        1) ip_preference="${RED}IPv6 已禁用${NC}" ;;
+        0)
+            if grep -qE '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100([[:space:]]|$)' /etc/gai.conf 2>/dev/null; then
+                ip_preference="${YELLOW}IPv4 优先${NC}"
+            else
+                ip_preference="${GREEN}系统默认${NC}"
+            fi
+            ;;
+        *) ip_preference="${YELLOW}未知${NC}" ;;
+    esac
     fail2ban_status=$(systemctl is-active fail2ban 2>/dev/null || true)
 
-    clear
-    echo "=================================================="
-    echo "             VPS 关键状态汇总"
-    echo "=================================================="
-    echo "版本:                 $VERSION"
-    echo "拥塞控制 / 队列:      $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 未知) / $(sysctl -n net.core.default_qdisc 2>/dev/null || echo 未知)"
-    echo "TCP 读缓冲上限:       $(sysctl -n net.core.rmem_max 2>/dev/null || echo 未知) bytes"
-    echo "TCP 写缓冲上限:       $(sysctl -n net.core.wmem_max 2>/dev/null || echo 未知) bytes"
-    echo "netdev backlog:        $(sysctl -n net.core.netdev_max_backlog 2>/dev/null || echo 未知)"
-    echo "SSH 配置端口:          ${ssh_port:-未知}"
-    echo "SSH 实际监听:          ${listening_ports:-未检测到}"
-    echo "SSH 密码登录:          ${password_auth:-未知}"
-    echo "IPv4/IPv6 优先级:      $ip_preference"
-    echo "Fail2ban:              ${fail2ban_status:-未安装或未运行}"
-    echo "SWAP:                  $(free -h | awk '/^Swap/{print $2" 总 / "$3" 已用"}')"
+    print_header "关键状态汇总"
+    echo -e "版本:                   ${CYAN}$VERSION${NC}"
+    echo -e "拥塞控制 / 队列:        ${YELLOW}${current_cc:-未知} / ${current_qdisc:-未知}${NC}"
+    echo -e "持久化配置值:           ${persistent_cc:-未检测到} / ${persistent_qdisc:-未检测到}"
+    echo "持久化来源:             $persistence_file"
+    echo "SSH 配置端口:           ${ssh_port:-未知}"
+    echo "SSH 实际监听:           ${listening_ports:-未检测到}"
+    echo -e "SSH 密码登录:           $password_display"
+    echo -e "IPv4 / IPv6:            $ip_preference"
+    case "$fail2ban_status" in
+        active) echo -e "Fail2ban:               ${GREEN}运行中${NC}" ;;
+        inactive|failed) echo -e "Fail2ban:               ${RED}${fail2ban_status}${NC}" ;;
+        *) echo -e "Fail2ban:               ${YELLOW}${fail2ban_status:-未安装或未知}${NC}" ;;
+    esac
+    echo "SWAP:                   $(free -h | awk '/^Swap/{print $2" 总 / "$3" 已用"}')"
     if [[ -f /var/run/reboot-required ]]; then
-        echo -e "重启状态:              ${YELLOW}需要重启${NC}"
+        echo -e "重启状态:               ${YELLOW}需要重启${NC}"
     else
-        echo "重启状态:              当前未检测到重启要求"
+        echo -e "重启状态:               ${GREEN}当前未检测到重启要求${NC}"
     fi
     echo "DNS:"
     show_dns_status
-    echo "=================================================="
-    read -p "按回车键返回主菜单..."
+    echo -e "${CYAN}==================================================${NC}"
+    pause_menu
+}
+
+show_readonly_diagnostics() {
+    local current_cc
+    local current_qdisc
+
+    print_header "只读配置诊断"
+    if sshd -t >/dev/null 2>&1; then
+        print_result "SSH 配置语法" "正常"
+    else
+        print_result "SSH 配置语法" "异常"
+    fi
+
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    if [[ "$current_cc" == "bbr" && "$current_qdisc" == "fq" ]]; then
+        print_result "BBR / FQ 运行状态" "正常" "$current_cc / $current_qdisc"
+    elif [[ -n "$current_cc" && -n "$current_qdisc" ]]; then
+        print_result "BBR / FQ 运行状态" "未启用" "$current_cc / $current_qdisc"
+    else
+        print_result "BBR / FQ 运行状态" "未知"
+    fi
+
+    if ip route show default 2>/dev/null | grep -q . || ip -6 route show default 2>/dev/null | grep -q .; then
+        print_result "默认路由" "正常"
+    else
+        print_result "默认路由" "异常"
+    fi
+    if timeout 8 getent ahosts github.com >/dev/null 2>&1 || \
+       timeout 8 getent ahosts cloudflare.com >/dev/null 2>&1; then
+        print_result "DNS 解析" "正常"
+    else
+        print_result "DNS 解析" "异常"
+    fi
+    if command -v fail2ban-client >/dev/null 2>&1; then
+        if timeout 15 fail2ban-client -t >/dev/null 2>&1; then
+            print_result "Fail2ban 配置" "正常"
+        else
+            print_result "Fail2ban 配置" "异常"
+        fi
+    else
+        print_result "Fail2ban 配置" "未安装"
+    fi
+    echo -e "${CYAN}==================================================${NC}"
+    pause_menu
+}
+
+show_recent_log() {
+    print_header "最近运行日志"
+    if [[ -s "$LOG_FILE" ]]; then
+        tail -n 40 "$LOG_FILE"
+    else
+        echo -e "${YELLOW}暂无日志内容。${NC}"
+    fi
+    echo -e "${CYAN}==================================================${NC}"
+    pause_menu
+}
+
+submenu_status() {
+    local choice_status
+
+    while true; do
+        print_header "状态与诊断"
+        print_menu_item 1 "查看关键状态汇总"
+        print_menu_item 2 "运行只读配置诊断" "SSH / BBR / 路由 / DNS / Fail2ban"
+        print_menu_item 3 "查看最近运行日志" "最近 40 行"
+        echo -e "  ${DIM}0. 返回主菜单${NC}"
+        echo -e "${CYAN}==================================================${NC}"
+        read -r -p "请输入选项 [0-3]: " choice_status
+        case "$choice_status" in
+            1) show_status_summary ;;
+            2) show_readonly_diagnostics ;;
+            3) show_recent_log ;;
+            0) return ;;
+            *) error "无效输入！"; sleep 1 ;;
+        esac
+    done
 }
 
 main_menu() {
@@ -1316,29 +1887,24 @@ main_menu() {
         DISK_STATUS=$(df -h / | awk 'NR==2{print $4" 可用 / "$2" 总"}')
         LOAD_AVG=$(cat /proc/loadavg | awk '{print "1m:"$1" 5m:"$2" 15m:"$3}')
         
-        clear
-        echo "=================================================="
-        echo -e "      ${GREEN}VPS 极简初始化与安全加固脚本 v$VERSION${NC}"
-        echo "=================================================="
-        echo -e "  当前系统: ${YELLOW}$OS_ID $OS_VERSION${NC}"
-        echo -e "  系统负载: ${YELLOW}$LOAD_AVG${NC}"
-        echo -e "  内存状态: ${YELLOW}$MEM_STATUS${NC}"
-        echo -e "  磁盘状态: ${YELLOW}$DISK_STATUS${NC}"
-        echo "--------------------------------------------------"
-        echo "  1. 基础环境与系统优化   # 更新/SWAP/时区"
-        echo "  2. 系统安全与防火墙     # SSH加固/防爆破"
-        echo "  3. 网络与内核优化       # BBR/DNS/IPv6"
-        echo "  4. 查看当前关键状态     # 网络/SSH/DNS/Fail2ban"
-        echo "--------------------------------------------------"
-        echo "  0. 退出脚本"
-        echo "=================================================="
-        read -p "请输入选项 [0-4]: " choice_main
+        print_header "VPS 初始化与安全工具 v$VERSION"
+        echo -e "  系统: ${YELLOW}$OS_ID $OS_VERSION${NC}  |  负载: ${YELLOW}$LOAD_AVG${NC}"
+        echo -e "  内存: ${YELLOW}$MEM_STATUS${NC}  |  磁盘: ${YELLOW}$DISK_STATUS${NC}"
+        echo -e "${DIM}--------------------------------------------------${NC}"
+        print_menu_item 1 "系统维护" "更新 / SWAP / 时区"
+        print_menu_item 2 "SSH 与安全" "SSH / 密钥登录 / Fail2ban"
+        print_menu_item 3 "网络配置" "BBR / DNS / IPv4·IPv6"
+        print_menu_item 4 "状态与诊断" "配置汇总 / 校验 / 日志"
+        echo -e "${DIM}--------------------------------------------------${NC}"
+        echo -e "  ${DIM}0. 退出脚本${NC}"
+        echo -e "${CYAN}==================================================${NC}"
+        read -r -p "请输入选项 [0-4]: " choice_main
 
         case "$choice_main" in
             1) submenu_env ;;
             2) submenu_sec ;;
             3) submenu_net ;;
-            4) show_status_summary ;;
+            4) submenu_status ;;
             0) clear; log "已安全退出脚本。"; exit 0 ;;
             *) error "无效输入，请重新选择！"; sleep 1 ;;
         esac
@@ -1349,4 +1915,5 @@ main_menu() {
 # 启动执行
 # ==========================================
 check_os
+check_dependencies
 main_menu
