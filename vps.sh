@@ -15,7 +15,7 @@ SYSCTL_FILE="/etc/sysctl.d/99-vps-init.conf"
 IPV6_SYSCTL_FILE="/etc/sysctl.d/99-zz-vps-init-ipv6.conf"
 SWAP_SYSCTL_FILE="/etc/sysctl.d/99-zz-vps-init-swap.conf"
 SSH_MANAGED_FILE="/etc/ssh/sshd_config.d/00-00-vps-init.conf"
-VERSION="1.1.3"
+VERSION="1.1.4"
 MANAGED_SWAP_FILE="/swapfile"
 BACKUP_DIR="/var/backups/vps-init"
 
@@ -86,7 +86,7 @@ print_result() {
     local color="$YELLOW"
 
     case "$state" in
-        正常|已启用|运行中) color="$GREEN" ;;
+        正常|已启用|运行中|成功|已完成) color="$GREEN" ;;
         异常|失败|已禁用) color="$RED" ;;
     esac
     printf '  %-22s ' "$label"
@@ -893,54 +893,597 @@ submenu_timezone() {
 }
 
 # ==========================================
-# 模块一：二级菜单 - 基础环境与系统优化
+# 模块一：系统清理辅助函数
 # ==========================================
-submenu_env() {
-    while true; do
-        print_header "系统维护"
-        print_menu_item 1 "更新软件包并清理旧内核" "按系统版本使用安全升级策略"
-        print_menu_item 2 "SWAP 配置" "›"
-        print_menu_item 3 "时间与时区配置" "›"
-        echo -e "  ${DIM}0. 返回主菜单${NC}"
-        echo -e "${CYAN}==================================================${NC}"
-        read -r -p "请输入选项 [0-3]: " choice_env
+format_bytes() {
+    local bytes="${1:-0}"
 
-        case "$choice_env" in
-            1) 
-                log "开始执行系统更新和清理..."
-                export DEBIAN_FRONTEND=noninteractive 
-                
-                if [[ "$OS_ID" == "debian" ]]; then
-                    if [[ "$OS_VERSION" == "12" ]]; then
-                        apt-get update -y || { error "更新源失败！"; pause_menu; continue; }
-                        apt-get full-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" || { error "系统升级失败！"; pause_menu; continue; }
-                        apt-get autoremove --purge -y && apt-get clean
-                        dpkg -l | grep ^rc | awk '{print $2}' | xargs -r dpkg -P
-                    elif [[ "$OS_VERSION" == "13" ]]; then
-                        apt update -y || { error "更新源失败！"; pause_menu; continue; }
-                        apt full-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" || { error "系统升级失败！"; pause_menu; continue; }
-                        apt autoremove --purge -y && apt clean
-                        dpkg -l | awk '/^rc/ {print $2}' | xargs -r apt-get purge -y
-                    else
-                        log "执行通用 Debian 更新策略..."
-                        apt-get update -y || { error "更新源失败！"; pause_menu; continue; }
-                        apt-get full-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" || { error "系统升级失败！"; pause_menu; continue; }
-                        apt-get autoremove --purge -y && apt-get clean
-                    fi
-                elif [[ "$OS_ID" == "ubuntu" ]]; then
-                    apt-get update -y || { error "更新源失败！"; pause_menu; continue; }
-                    apt-get full-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" || { error "系统升级失败！"; pause_menu; continue; }
-                    apt-get autoremove --purge -y && apt-get clean
-                fi
-                log "系统更新与清理完成。"
-                if [[ -f /var/run/reboot-required ]]; then
-                    echo -e "${YELLOW}检测到系统需要重启。请重启后再确认新内核和 BBR 是否完全生效。${NC}"
-                    [[ -f /var/run/reboot-required.pkgs ]] && sed 's/^/ - /' /var/run/reboot-required.pkgs
+    [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+    if command -v numfmt >/dev/null 2>&1; then
+        numfmt --to=iec-i --suffix=B "$bytes"
+    else
+        awk -v value="$bytes" 'BEGIN {
+            split("B KiB MiB GiB TiB", units, " ")
+            index=1
+            while (value >= 1024 && index < 5) {
+                value /= 1024
+                index++
+            }
+            printf "%.1f%s", value, units[index]
+        }'
+    fi
+}
+
+get_path_size_bytes() {
+    local target="$1"
+
+    if [[ -e "$target" ]] && command -v du >/dev/null 2>&1; then
+        du -sb -- "$target" 2>/dev/null | awk 'NR==1 {print $1+0}'
+    else
+        echo 0
+    fi
+}
+
+get_root_used_bytes() {
+    df -B1 --output=used / 2>/dev/null | awk 'NR==2 {gsub(/[[:space:]]/, ""); print $1+0}'
+}
+
+show_released_space() {
+    local before="$1"
+    local after="$2"
+    local released=0
+
+    if [[ "$before" =~ ^[0-9]+$ && "$after" =~ ^[0-9]+$ && "$before" -gt "$after" ]]; then
+        released=$((before - after))
+    fi
+    echo -e "实际释放空间：${GREEN}$(format_bytes "$released")${NC}"
+}
+
+package_manager_ready() {
+    local audit_output
+    local lock_file
+    local -a lock_files=(
+        /var/lib/dpkg/lock-frontend
+        /var/lib/dpkg/lock
+        /var/lib/apt/lists/lock
+        /var/cache/apt/archives/lock
+    )
+
+    if command -v fuser >/dev/null 2>&1; then
+        for lock_file in "${lock_files[@]}"; do
+            if [[ -e "$lock_file" ]] && fuser "$lock_file" >/dev/null 2>&1; then
+                error "检测到软件包管理器正在运行，请等待其结束后再试。"
+                return 1
+            fi
+        done
+    fi
+
+    audit_output=$(dpkg --audit 2>/dev/null || true)
+    if [[ -n "$audit_output" ]]; then
+        error "检测到未完成的软件包配置，请先处理后再执行清理："
+        echo "$audit_output"
+        return 1
+    fi
+}
+
+collect_package_cleanup_candidates() {
+    local package
+    local simulation_output
+    local -a simulated_packages=()
+
+    AUTOREMOVE_PACKAGES=()
+    AUTOREMOVE_KERNEL_PACKAGES=()
+    RESIDUAL_PACKAGES=()
+
+    if ! simulation_output=$(LC_ALL=C apt-get -s -o Debug::NoLocking=1 autoremove --purge 2>&1); then
+        error "无法生成无用软件包清理预览，已停止操作："
+        echo "$simulation_output"
+        return 1
+    fi
+    mapfile -t simulated_packages < <(printf '%s\n' "$simulation_output" | awk '/^Remv / {print $2}')
+    for package in "${simulated_packages[@]}"; do
+        case "$package" in
+            linux-image-*|linux-image-unsigned-*|linux-headers-*|linux-modules-*|linux-modules-extra-*)
+                AUTOREMOVE_KERNEL_PACKAGES+=("$package")
+                ;;
+            *)
+                AUTOREMOVE_PACKAGES+=("$package")
+                ;;
+        esac
+    done
+
+    mapfile -t RESIDUAL_PACKAGES < <(
+        dpkg-query -W -f='${binary:Package}\t${db:Status-Abbrev}\n' 2>/dev/null |
+            awk '$2 ~ /^rc/ {sub(/:.*/, "", $1); print $1}'
+    )
+}
+
+print_package_cleanup_candidates() {
+    local package
+
+    echo "无用依赖包：${#AUTOREMOVE_PACKAGES[@]} 个"
+    for package in "${AUTOREMOVE_PACKAGES[@]}"; do
+        echo " - $package"
+    done
+    echo "残留配置包：${#RESIDUAL_PACKAGES[@]} 个"
+    for package in "${RESIDUAL_PACKAGES[@]}"; do
+        echo " - $package"
+    done
+    if (( ${#AUTOREMOVE_KERNEL_PACKAGES[@]} > 0 )); then
+        echo -e "${YELLOW}检测到 ${#AUTOREMOVE_KERNEL_PACKAGES[@]} 个内核相关候选，已保留给“清理旧内核”单独处理。${NC}"
+    fi
+}
+
+perform_package_cleanup() {
+    local failed=0
+
+    if (( ${#AUTOREMOVE_PACKAGES[@]} > 0 )); then
+        if apt-get purge -y -- "${AUTOREMOVE_PACKAGES[@]}"; then
+            print_result "无用依赖包" "已完成" "${#AUTOREMOVE_PACKAGES[@]} 个"
+        else
+            print_result "无用依赖包" "失败"
+            failed=1
+        fi
+    else
+        print_result "无用依赖包" "跳过" "未发现"
+    fi
+
+    if (( ${#RESIDUAL_PACKAGES[@]} > 0 )); then
+        if apt-get purge -y -- "${RESIDUAL_PACKAGES[@]}"; then
+            print_result "残留配置包" "已完成" "${#RESIDUAL_PACKAGES[@]} 个"
+        else
+            print_result "残留配置包" "失败"
+            failed=1
+        fi
+    else
+        print_result "残留配置包" "跳过" "未发现"
+    fi
+
+    return "$failed"
+}
+
+perform_cache_cleanup() {
+    if apt-get clean; then
+        print_result "APT 下载缓存" "已完成"
+        return 0
+    fi
+    print_result "APT 下载缓存" "失败"
+    return 1
+}
+
+get_old_crash_count() {
+    local directory
+    local count=0
+
+    for directory in /var/crash /var/lib/systemd/coredump; do
+        [[ -d "$directory" ]] || continue
+        count=$((count + $(find "$directory" -xdev -type f -mtime +7 -print 2>/dev/null | wc -l)))
+    done
+    echo "$count"
+}
+
+perform_log_cleanup() {
+    local directory
+    local crash_failed=0
+    local failed=0
+
+    if command -v journalctl >/dev/null 2>&1; then
+        if journalctl --vacuum-time=7d; then
+            print_result "systemd 历史日志" "已完成" "保留最近 7 天"
+        else
+            print_result "systemd 历史日志" "失败"
+            failed=1
+        fi
+    else
+        print_result "systemd 历史日志" "跳过" "journalctl 不可用"
+    fi
+
+    if command -v systemd-tmpfiles >/dev/null 2>&1; then
+        if systemd-tmpfiles --clean; then
+            print_result "过期临时文件" "已完成"
+        else
+            print_result "过期临时文件" "失败"
+            failed=1
+        fi
+    else
+        print_result "过期临时文件" "跳过" "systemd-tmpfiles 不可用"
+    fi
+
+    for directory in /var/crash /var/lib/systemd/coredump; do
+        [[ -d "$directory" ]] || continue
+        if ! find "$directory" -xdev -type f -mtime +7 -delete 2>/dev/null; then
+            crash_failed=1
+        fi
+    done
+    if [[ "$crash_failed" == "0" ]]; then
+        print_result "过期崩溃转储" "已完成" "仅删除 7 天前文件"
+    else
+        print_result "过期崩溃转储" "失败"
+        failed=1
+    fi
+
+    return "$failed"
+}
+
+cleanup_package_cache() {
+    local before
+    local after
+
+    package_manager_ready || return 1
+    before=$(get_path_size_bytes /var/cache/apt/archives)
+    echo "APT 下载缓存占用：$(format_bytes "$before")"
+    confirm_action "确认清理全部 APT 下载缓存和下载残片吗？" || return 0
+    perform_cache_cleanup
+    after=$(get_path_size_bytes /var/cache/apt/archives)
+    show_released_space "$before" "$after"
+}
+
+cleanup_unused_packages() {
+    local before
+    local after
+
+    package_manager_ready || return 1
+    collect_package_cleanup_candidates || return 1
+    if (( ${#AUTOREMOVE_PACKAGES[@]} == 0 && ${#RESIDUAL_PACKAGES[@]} == 0 )); then
+        echo -e "${GREEN}未发现可清理的无用软件包或残留配置。${NC}"
+        (( ${#AUTOREMOVE_KERNEL_PACKAGES[@]} > 0 )) &&
+            echo -e "${YELLOW}内核相关候选请在“清理旧内核”中单独确认。${NC}"
+        return 0
+    fi
+
+    print_package_cleanup_candidates
+    confirm_action "确认只删除以上非内核软件包和残留配置吗？" || return 0
+    before=$(get_root_used_bytes)
+    perform_package_cleanup
+    after=$(get_root_used_bytes)
+    show_released_space "$before" "$after"
+}
+
+collect_old_kernel_candidates() {
+    local image
+    local owner
+    local release
+    local header_base
+    local package
+    local current_kernel
+    local latest_kernel
+    local fallback_kernel
+    local -a installed_releases=()
+    local -a installed_kernel_packages=()
+
+    OLD_KERNEL_RELEASES=()
+    OLD_KERNEL_PACKAGES=()
+    current_kernel=$(uname -r)
+
+    for image in /boot/vmlinuz-*; do
+        [[ -e "$image" ]] || continue
+        owner=$(dpkg-query -S "$image" 2>/dev/null | awk -F': ' 'NR==1 {print $1}')
+        [[ "$owner" == linux-image-* ]] || continue
+        installed_releases+=("${image#/boot/vmlinuz-}")
+    done
+
+    if (( ${#installed_releases[@]} == 0 )); then
+        warn "未在 /boot 中检测到由软件包管理器安装的内核。"
+        return 1
+    fi
+    mapfile -t installed_releases < <(printf '%s\n' "${installed_releases[@]}" | sort -Vu)
+
+    if ! printf '%s\n' "${installed_releases[@]}" | grep -Fxq "$current_kernel"; then
+        warn "当前运行内核 $current_kernel 不在可识别的软件包列表中，已停止清理。"
+        return 1
+    fi
+    latest_kernel="${installed_releases[-1]}"
+    if [[ "$current_kernel" != "$latest_kernel" ]]; then
+        warn "当前运行内核 $current_kernel 不是最新已安装内核 $latest_kernel，请先重启。"
+        return 1
+    fi
+    if [[ -f /var/run/reboot-required ]]; then
+        warn "系统提示需要重启，为避免删除仍需回退的内核，本次不执行旧内核清理。"
+        return 1
+    fi
+    if (( ${#installed_releases[@]} <= 2 )); then
+        echo -e "${GREEN}当前仅有运行内核和一个备用内核，无需清理。${NC}"
+        return 0
+    fi
+
+    fallback_kernel="${installed_releases[-2]}"
+    for release in "${installed_releases[@]}"; do
+        [[ "$release" == "$current_kernel" || "$release" == "$latest_kernel" || "$release" == "$fallback_kernel" ]] && continue
+        OLD_KERNEL_RELEASES+=("$release")
+    done
+
+    mapfile -t installed_kernel_packages < <(
+        dpkg-query -W -f='${binary:Package}\t${db:Status-Abbrev}\n' \
+            'linux-image-[0-9]*' 'linux-image-unsigned-[0-9]*' \
+            'linux-headers-[0-9]*' 'linux-modules-[0-9]*' \
+            'linux-modules-extra-[0-9]*' 2>/dev/null |
+            awk '$2 ~ /^ii/ {sub(/:.*/, "", $1); print $1}'
+    )
+
+    for release in "${OLD_KERNEL_RELEASES[@]}"; do
+        header_base="${release%-*}"
+        for package in "${installed_kernel_packages[@]}"; do
+            case "$package" in
+                linux-image-"$release"|linux-image-unsigned-"$release"|\
+                linux-modules-"$release"|linux-modules-extra-"$release"|\
+                linux-headers-"$release"|linux-headers-"$header_base"|linux-headers-"$header_base"-*)
+                    add_unique_path OLD_KERNEL_PACKAGES "$package"
+                    ;;
+            esac
+        done
+    done
+
+    echo "当前运行内核：$current_kernel"
+    echo "保留备用内核：$fallback_kernel"
+}
+
+cleanup_old_kernels() {
+    local before
+    local after
+    local planned
+    local simulation_output
+    local -a planned_removals=()
+
+    package_manager_ready || return 1
+    collect_old_kernel_candidates || return 1
+    if (( ${#OLD_KERNEL_RELEASES[@]} == 0 || ${#OLD_KERNEL_PACKAGES[@]} == 0 )); then
+        return 0
+    fi
+
+    echo "候选旧内核版本："
+    printf ' - %s\n' "${OLD_KERNEL_RELEASES[@]}"
+    echo "关联软件包："
+    printf ' - %s\n' "${OLD_KERNEL_PACKAGES[@]}"
+
+    if ! simulation_output=$(LC_ALL=C apt-get -s purge -- "${OLD_KERNEL_PACKAGES[@]}" 2>&1); then
+        error "无法生成旧内核删除预览，已停止操作："
+        echo "$simulation_output"
+        return 1
+    fi
+    mapfile -t planned_removals < <(printf '%s\n' "$simulation_output" | awk '/^Remv / {print $2}')
+    if (( ${#planned_removals[@]} == 0 )); then
+        error "删除预览中未发现任何候选软件包，已停止操作。"
+        return 1
+    fi
+    for planned in "${planned_removals[@]}"; do
+        if ! printf '%s\n' "${OLD_KERNEL_PACKAGES[@]}" | grep -Fxq "$planned"; then
+            error "模拟删除还会影响非候选软件包 $planned，已停止操作。"
+            return 1
+        fi
+    done
+
+    echo -e "${YELLOW}旧内核不会被常规清理自动删除，本操作仅在你确认后执行。${NC}"
+    confirm_action "确认删除以上旧内核吗？" || return 0
+
+    before=$(get_root_used_bytes)
+    if apt-get purge -y -- "${OLD_KERNEL_PACKAGES[@]}"; then
+        command -v update-grub >/dev/null 2>&1 && update-grub >/dev/null 2>&1
+        print_result "旧内核" "已完成" "${#OLD_KERNEL_RELEASES[@]} 个版本"
+    else
+        print_result "旧内核" "失败"
+        return 1
+    fi
+    after=$(get_root_used_bytes)
+    show_released_space "$before" "$after"
+}
+
+cleanup_system_logs() {
+    local journal_usage="不可用"
+    local crash_count
+    local before
+    local after
+
+    command -v journalctl >/dev/null 2>&1 &&
+        journal_usage=$(journalctl --disk-usage 2>/dev/null | sed 's/^Archived and active journals take up //')
+    crash_count=$(get_old_crash_count)
+
+    echo "systemd 日志占用：$journal_usage"
+    echo "7 天前的崩溃转储：$crash_count 个"
+    echo "临时文件将严格按照 systemd-tmpfiles 的系统策略清理。"
+    confirm_action "确认保留最近 7 天日志并清理过期临时文件和崩溃转储吗？" || return 0
+
+    before=$(get_root_used_bytes)
+    perform_log_cleanup
+    after=$(get_root_used_bytes)
+    show_released_space "$before" "$after"
+}
+
+run_regular_cleanup() {
+    local cache_size
+    local journal_usage="不可用"
+    local crash_count
+    local before
+    local after
+
+    package_manager_ready || return 1
+    collect_package_cleanup_candidates || return 1
+    cache_size=$(get_path_size_bytes /var/cache/apt/archives)
+    crash_count=$(get_old_crash_count)
+    command -v journalctl >/dev/null 2>&1 &&
+        journal_usage=$(journalctl --disk-usage 2>/dev/null | sed 's/^Archived and active journals take up //')
+
+    echo "常规清理预览："
+    echo " - APT 下载缓存：$(format_bytes "$cache_size")"
+    echo " - 非内核无用依赖：${#AUTOREMOVE_PACKAGES[@]} 个"
+    echo " - 残留配置：${#RESIDUAL_PACKAGES[@]} 个"
+    echo " - systemd 日志：$journal_usage（保留 7 天）"
+    echo " - 过期崩溃转储：$crash_count 个"
+    if (( ${#AUTOREMOVE_KERNEL_PACKAGES[@]} > 0 )); then
+        echo -e "${YELLOW} - 内核相关候选：${#AUTOREMOVE_KERNEL_PACKAGES[@]} 个（本次保留）${NC}"
+    fi
+    echo " - 过期临时文件：按 systemd-tmpfiles 策略"
+    confirm_action "确认执行以上常规清理吗？" || return 0
+
+    before=$(get_root_used_bytes)
+    perform_cache_cleanup
+    perform_package_cleanup
+    perform_log_cleanup
+    after=$(get_root_used_bytes)
+    show_released_space "$before" "$after"
+}
+
+cleanup_disabled_snaps() {
+    local entry
+    local name
+    local revision
+    local -a disabled_snaps=()
+
+    if ! command -v snap >/dev/null 2>&1; then
+        echo -e "${YELLOW}未安装 Snap，已跳过。${NC}"
+        return 0
+    fi
+    mapfile -t disabled_snaps < <(LANG=C snap list --all 2>/dev/null | awk '$6=="disabled" {print $1"\t"$3}')
+    if (( ${#disabled_snaps[@]} == 0 )); then
+        echo -e "${GREEN}未发现 disabled 状态的 Snap 旧版本。${NC}"
+        return 0
+    fi
+
+    echo "待删除的 Snap 旧版本："
+    printf ' - %s\n' "${disabled_snaps[@]}"
+    confirm_action "确认删除以上 disabled 状态的 Snap 旧版本吗？" || return 0
+    for entry in "${disabled_snaps[@]}"; do
+        IFS=$'\t' read -r name revision <<< "$entry"
+        snap remove "$name" --revision="$revision" || error "Snap $name 修订版 $revision 删除失败。"
+    done
+}
+
+submenu_advanced_cleanup() {
+    local choice_advanced
+    local snap_state="未安装"
+    local docker_state="未安装"
+
+    command -v snap >/dev/null 2>&1 && snap_state="可用"
+    command -v docker >/dev/null 2>&1 && docker_state="可用"
+    while true; do
+        print_header "高级清理"
+        echo -e "  ${YELLOW}[!] 以下项目均需单独确认${NC}"
+        print_menu_item 1 "清理 Snap 旧版本" "$snap_state"
+        print_menu_item 2 "清理 Docker 悬空镜像" "$docker_state"
+        print_menu_item 3 "清理 Docker 构建缓存" "$docker_state"
+        echo -e "  ${DIM}0. 返回上一级${NC}"
+        echo -e "${CYAN}==================================================${NC}"
+        read -r -p "请输入选项 [0-3]: " choice_advanced
+
+        case "$choice_advanced" in
+            1) cleanup_disabled_snaps; pause_menu ;;
+            2)
+                if ! command -v docker >/dev/null 2>&1; then
+                    warn "未安装 Docker。"
+                else
+                    docker system df
+                    confirm_action "确认清理 Docker 悬空镜像吗？不会删除容器和数据卷。" &&
+                        docker image prune -f
                 fi
                 pause_menu
                 ;;
-            2) submenu_swap ;;
-            3) submenu_timezone ;;
+            3)
+                if ! command -v docker >/dev/null 2>&1; then
+                    warn "未安装 Docker。"
+                else
+                    docker system df
+                    confirm_action "确认清理 Docker 构建缓存吗？不会删除容器和数据卷。" &&
+                        docker builder prune -f
+                fi
+                pause_menu
+                ;;
+            0) return ;;
+            *) error "无效输入！"; sleep 1 ;;
+        esac
+    done
+}
+
+show_disk_usage() {
+    print_header "磁盘占用分析"
+    df -hT /
+    echo
+    echo "主要目录占用（扫描最多 30 秒）："
+    timeout 30 du -x -h --max-depth=1 /var /usr /opt 2>/dev/null | sort -h
+    if [[ "${PIPESTATUS[0]}" -ne 0 ]]; then
+        warn "目录扫描超时或部分路径不可读。"
+    fi
+    echo -e "${CYAN}==================================================${NC}"
+}
+
+submenu_cleanup() {
+    local choice_cleanup
+    local cache_size
+    local disk_status
+
+    while true; do
+        cache_size=$(get_path_size_bytes /var/cache/apt/archives)
+        disk_status=$(df -h / | awk 'NR==2 {print $3" 已用 / "$2" 总 ("$5")"}')
+        print_header "系统清理"
+        echo -e "  当前磁盘：${YELLOW}$disk_status${NC}"
+        echo -e "${DIM}--------------------------------------------------${NC}"
+        print_menu_item 1 "执行常规清理" "不包含旧内核和高级项目"
+        print_menu_item 2 "清理软件包缓存" "当前 $(format_bytes "$cache_size")"
+        print_menu_item 3 "清理无用软件包" "无用依赖和残留配置"
+        print_menu_item 4 "清理旧内核" "独立预览并确认"
+        print_menu_item 5 "清理系统日志" "日志、临时文件和崩溃转储"
+        print_menu_item 6 "高级清理" "›"
+        print_menu_item 7 "查看磁盘占用" "只读分析"
+        echo -e "  ${DIM}0. 返回上一级${NC}"
+        echo -e "${CYAN}==================================================${NC}"
+        read -r -p "请输入选项 [0-7]: " choice_cleanup
+
+        case "$choice_cleanup" in
+            1) run_regular_cleanup; pause_menu ;;
+            2) cleanup_package_cache; pause_menu ;;
+            3) cleanup_unused_packages; pause_menu ;;
+            4) cleanup_old_kernels; pause_menu ;;
+            5) cleanup_system_logs; pause_menu ;;
+            6) submenu_advanced_cleanup ;;
+            7) show_disk_usage; pause_menu ;;
+            0) return ;;
+            *) error "无效输入！"; sleep 1 ;;
+        esac
+    done
+}
+
+update_system_packages() {
+    package_manager_ready || return 1
+    export DEBIAN_FRONTEND=noninteractive
+
+    log "开始执行系统更新..."
+    apt-get update || {
+        error "更新软件源失败！"
+        return 1
+    }
+    apt-get full-upgrade -y \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" || {
+        error "系统升级失败！"
+        return 1
+    }
+
+    log "系统更新完成，未执行任何清理操作。"
+    if [[ -f /var/run/reboot-required ]]; then
+        echo -e "${YELLOW}检测到系统需要重启。请先重启，再考虑清理旧内核。${NC}"
+        [[ -f /var/run/reboot-required.pkgs ]] && sed 's/^/ - /' /var/run/reboot-required.pkgs
+    fi
+}
+
+# ==========================================
+# 模块一：二级菜单 - 基础环境与系统优化
+# ==========================================
+submenu_env() {
+    local choice_env
+
+    while true; do
+        print_header "系统维护"
+        print_menu_item 1 "更新系统软件包" "仅更新，不自动清理"
+        print_menu_item 2 "系统清理" "缓存 / 无用包 / 旧内核 / 日志 ›"
+        print_menu_item 3 "SWAP 配置" "›"
+        print_menu_item 4 "时间与时区配置" "›"
+        echo -e "  ${DIM}0. 返回主菜单${NC}"
+        echo -e "${CYAN}==================================================${NC}"
+        read -r -p "请输入选项 [0-4]: " choice_env
+
+        case "$choice_env" in
+            1) update_system_packages; pause_menu ;;
+            2) submenu_cleanup ;;
+            3) submenu_swap ;;
+            4) submenu_timezone ;;
             0) return ;;
             *) error "无效输入！"; sleep 1 ;;
         esac
@@ -1891,7 +2434,7 @@ main_menu() {
         echo -e "  系统: ${YELLOW}$OS_ID $OS_VERSION${NC}  |  负载: ${YELLOW}$LOAD_AVG${NC}"
         echo -e "  内存: ${YELLOW}$MEM_STATUS${NC}  |  磁盘: ${YELLOW}$DISK_STATUS${NC}"
         echo -e "${DIM}--------------------------------------------------${NC}"
-        print_menu_item 1 "系统维护" "更新 / SWAP / 时区"
+        print_menu_item 1 "系统维护" "更新 / 清理 / SWAP / 时区"
         print_menu_item 2 "SSH 与安全" "SSH / 密钥登录 / Fail2ban"
         print_menu_item 3 "网络配置" "BBR / DNS / IPv4·IPv6"
         print_menu_item 4 "状态与诊断" "配置汇总 / 校验 / 日志"

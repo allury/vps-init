@@ -3,14 +3,14 @@
 [![Quality](https://github.com/allury/vps-init/actions/workflows/quality.yml/badge.svg)](https://github.com/allury/vps-init/actions/workflows/quality.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-面向 Debian 和 Ubuntu VPS 的交互式初始化与安全加固脚本。当前版本为 **1.1.3**，集中提供系统更新、SWAP、时区、SSH、Fail2ban、BBR、DNS 和 IPv6 等常用运维操作。
+面向 Debian 和 Ubuntu VPS 的交互式初始化与安全加固脚本。当前版本为 **1.1.4**，集中提供系统更新、系统清理、SWAP、时区、SSH、Fail2ban、BBR、DNS 和 IPv6 等常用运维操作。
 
 > [!WARNING]
 > 本项目会修改 SSH、网络、内核及系统服务配置。运行前请创建快照、确认云厂商控制台可用，并保留一个已登录的备用会话。请先在测试实例验证，再用于生产环境。
 
 ## 功能
 
-- 系统更新与软件包清理
+- 独立的系统更新与分级清理
 - SWAP 创建、检查与删除
 - 时区和时间同步配置
 - SSH 端口及密钥登录加固
@@ -21,6 +21,14 @@
 - 关键 SSH 操作的配置校验与失败回滚
 - Ubuntu 24.04+ `ssh.socket` 处理、真实监听端口检测和 Fail2ban 端口同步
 - BBR、SSH、DNS、IPv6、SWAP 与 Fail2ban 关键状态汇总
+
+## 1.1.4 更新
+
+- 将系统更新与清理拆分为独立操作，升级完成后不再自动执行软件包、缓存或旧内核清理。
+- 新增常规清理菜单，统一预览并处理 APT 下载缓存、非内核无用依赖、残留配置、过期 systemd 日志、临时文件和崩溃转储。
+- 旧内核改为独立扫描与确认流程，始终保留当前运行内核、最新内核和一个备用内核；检测到待重启或额外软件包删除时自动停止。
+- 新增 Snap 旧版本、Docker 悬空镜像和构建缓存等高级清理选项，不自动删除容器或数据卷。
+- 清理操作显示候选项目、执行状态以及实际释放空间；未安装的可选组件会明确跳过。
 
 ## 1.1.3 更新
 
