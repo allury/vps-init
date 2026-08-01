@@ -705,7 +705,7 @@ persist_bbr_settings() {
     return 1
 }
 
-if [[ $EUID -ne 0 ]]; then
+if [[ "${BASH_SOURCE[0]}" == "$0" && $EUID -ne 0 ]]; then
     error "请以 root 权限运行本脚本！"
     exit 1
 fi
