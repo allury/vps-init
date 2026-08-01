@@ -64,14 +64,21 @@ jobs:
           fi
 
           if ! git rev-parse --verify "refs/tags/${tag}^{commit}" >/dev/null; then
+            if [[ "$EVENT_NAME" == "push" && "$REF_TYPE" == "branch" ]]; then
+              echo "Release tag has not been pushed yet; waiting for tag: $tag"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             echo "Git tag does not exist: $tag" >&2
             exit 1
           fi
 
+          echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "notes_file=$notes_file" >> "$GITHUB_OUTPUT"
 
       - name: Create or synchronize Release
+        if: steps.release.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           NOTES_FILE: ${{ steps.release.outputs.notes_file }}
