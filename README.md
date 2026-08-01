@@ -3,7 +3,7 @@
 [![Quality](https://github.com/allury/vps-init/actions/workflows/quality.yml/badge.svg)](https://github.com/allury/vps-init/actions/workflows/quality.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-面向 Debian 和 Ubuntu VPS 的交互式初始化与安全加固脚本。当前版本为 **1.1.4**，集中提供系统更新、系统清理、SWAP、时区、SSH、Fail2ban、BBR、DNS 和 IPv6 等常用运维操作。
+面向 Debian 和 Ubuntu VPS 的交互式初始化与安全加固脚本。当前版本为 **1.1.5**，集中提供系统更新、系统清理、SWAP、时区、SSH、Fail2ban、BBR、DNS 和 IPv6 等常用运维操作。
 
 > [!WARNING]
 > 本项目会修改 SSH、网络、内核及系统服务配置。运行前请创建快照、确认云厂商控制台可用，并保留一个已登录的备用会话。请先在测试实例验证，再用于生产环境。
@@ -21,6 +21,14 @@
 - 关键 SSH 操作的配置校验与失败回滚
 - Ubuntu 24.04+ `ssh.socket` 处理、真实监听端口检测和 Fail2ban 端口同步
 - BBR、SSH、DNS、IPv6、SWAP 与 Fail2ban 关键状态汇总
+
+## 1.1.5 更新
+
+- Fail2ban 改为在 `/etc/fail2ban/jail.local` 中增量维护 `[sshd]`，保留其他 jail 和自定义项；应用前备份并校验配置，失败时自动回滚。
+- 强化 SSH、SWAP、IPv6 与 BBR 的事务式回滚及运行、持久化验证，准确报告未完整恢复的状态。
+- DNS 增加目标服务器与默认链路验证、配置文件符号链接保护和原子更新，失败时恢复网络配置。
+- 修正 systemd-sysctl 点号与斜杠键识别、模块依赖检测、时间同步状态报告和关键状态来源显示。
+- 改进清理结果汇总及旧内核筛选，避免移除保留内核共用的 headers，并检查 GRUB 配置刷新结果。
 
 ## 1.1.4 更新
 
