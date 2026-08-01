@@ -1586,22 +1586,31 @@ cleanup_unused_packages() {
 }
 
 collect_old_kernel_candidates() {
+    local retention_policy="${1:-keep-fallback}"
     local image
     local owner
     local release
-    local header_base
     local package
     local current_kernel
     local latest_kernel
     local fallback_kernel
     local retained_release
-    local shared_header_in_use
+    local old_release
+    local related_stem
+    local old_uses_related
+    local retained_uses_related
     local -a installed_releases=()
     local -a installed_kernel_packages=()
+    local -a retained_releases=()
 
     OLD_KERNEL_RELEASES=()
     OLD_KERNEL_PACKAGES=()
     current_kernel=$(uname -r)
+
+    if [[ "$retention_policy" != "keep-fallback" && "$retention_policy" != "current-only" ]]; then
+        error "未知的旧内核保留策略：$retention_policy"
+        return 1
+    fi
 
     for image in /boot/vmlinuz-*; do
         [[ -e "$image" ]] || continue
@@ -1629,71 +1638,102 @@ collect_old_kernel_candidates() {
         warn "系统提示需要重启，为避免删除仍需回退的内核，本次不执行旧内核清理。"
         return 1
     fi
-    if (( ${#installed_releases[@]} <= 2 )); then
-        echo -e "${GREEN}当前仅有运行内核和一个备用内核，无需清理。${NC}"
-        return 0
+
+    if [[ "$retention_policy" == "keep-fallback" ]]; then
+        if (( ${#installed_releases[@]} <= 2 )); then
+            echo -e "${GREEN}当前仅有运行内核和一个备用内核，无需清理。${NC}"
+            return 0
+        fi
+        fallback_kernel="${installed_releases[-2]}"
+        retained_releases=("$current_kernel" "$latest_kernel" "$fallback_kernel")
+    else
+        if (( ${#installed_releases[@]} <= 1 )); then
+            echo -e "${GREEN}当前没有可删除的旧内核。${NC}"
+            return 0
+        fi
+        retained_releases=("$current_kernel")
     fi
 
-    fallback_kernel="${installed_releases[-2]}"
     for release in "${installed_releases[@]}"; do
-        [[ "$release" == "$current_kernel" || "$release" == "$latest_kernel" || "$release" == "$fallback_kernel" ]] && continue
+        if printf '%s\n' "${retained_releases[@]}" | grep -Fxq "$release"; then
+            continue
+        fi
         OLD_KERNEL_RELEASES+=("$release")
     done
 
     mapfile -t installed_kernel_packages < <(
         dpkg-query -W -f='${binary:Package}\t${db:Status-Abbrev}\n' \
             'linux-image-[0-9]*' 'linux-image-unsigned-[0-9]*' \
+            'linux-image-extra-[0-9]*' \
             'linux-headers-[0-9]*' 'linux-modules-[0-9]*' \
-            'linux-modules-extra-[0-9]*' 2>/dev/null |
+            'linux-modules-extra-[0-9]*' 'linux-tools-[0-9]*' \
+            'linux-cloud-tools-[0-9]*' 2>/dev/null |
             awk '$2 ~ /^ii/ {sub(/:.*/, "", $1); print $1}'
     )
 
     for release in "${OLD_KERNEL_RELEASES[@]}"; do
-        header_base="${release%-*}"
-        shared_header_in_use=0
-        for retained_release in "$current_kernel" "$latest_kernel" "$fallback_kernel"; do
-            if [[ "${retained_release%-*}" == "$header_base" ]]; then
-                shared_header_in_use=1
-                break
-            fi
-        done
         for package in "${installed_kernel_packages[@]}"; do
             case "$package" in
                 linux-image-"$release"|linux-image-unsigned-"$release"|\
+                 linux-image-extra-"$release"|\
                  linux-modules-"$release"|linux-modules-extra-"$release"|\
-                 linux-headers-"$release")
+                 linux-headers-"$release"|linux-tools-"$release"|\
+                 linux-cloud-tools-"$release")
                     add_unique_path OLD_KERNEL_PACKAGES "$package"
-                    ;;
-                linux-headers-"$header_base")
-                    if [[ "$shared_header_in_use" == "0" ]]; then
-                        add_unique_path OLD_KERNEL_PACKAGES "$package"
-                    fi
                     ;;
             esac
         done
     done
 
+    for package in "${installed_kernel_packages[@]}"; do
+        case "$package" in
+            linux-headers-[0-9]*)
+                related_stem="${package#linux-headers-}"
+                ;;
+            linux-tools-[0-9]*)
+                related_stem="${package#linux-tools-}"
+                ;;
+            linux-cloud-tools-[0-9]*)
+                related_stem="${package#linux-cloud-tools-}"
+                ;;
+            *)
+                continue
+                ;;
+        esac
+        related_stem="${related_stem%-common}"
+        old_uses_related=0
+        retained_uses_related=0
+        for old_release in "${OLD_KERNEL_RELEASES[@]}"; do
+            if [[ "$old_release" == "$related_stem"-* ]]; then
+                old_uses_related=1
+                break
+            fi
+        done
+        [[ "$old_uses_related" == "1" ]] || continue
+        for retained_release in "${retained_releases[@]}"; do
+            if [[ "$retained_release" == "$related_stem"-* ]]; then
+                retained_uses_related=1
+                break
+            fi
+        done
+        if [[ "$retained_uses_related" == "0" ]]; then
+            add_unique_path OLD_KERNEL_PACKAGES "$package"
+        fi
+    done
+
     echo "当前运行内核：$current_kernel"
-    echo "保留备用内核：$fallback_kernel"
+    if [[ "$retention_policy" == "keep-fallback" ]]; then
+        echo "保留备用内核：$fallback_kernel"
+    else
+        echo -e "${RED}保留策略：仅保留当前运行内核，不保留备用内核${NC}"
+    fi
 }
 
-cleanup_old_kernels() {
-    local before
-    local after
+validate_old_kernel_removal_plan() {
+    local package
     local planned
     local simulation_output
     local -a planned_removals=()
-
-    package_manager_ready || return 1
-    collect_old_kernel_candidates || return 1
-    if (( ${#OLD_KERNEL_RELEASES[@]} == 0 || ${#OLD_KERNEL_PACKAGES[@]} == 0 )); then
-        return 0
-    fi
-
-    echo "候选旧内核版本："
-    printf ' - %s\n' "${OLD_KERNEL_RELEASES[@]}"
-    echo "关联软件包："
-    printf ' - %s\n' "${OLD_KERNEL_PACKAGES[@]}"
 
     if ! simulation_output=$(LC_ALL=C apt-get -s purge -- "${OLD_KERNEL_PACKAGES[@]}" 2>&1); then
         error "无法生成旧内核删除预览，已停止操作："
@@ -1712,16 +1752,35 @@ cleanup_old_kernels() {
         fi
     done
 
-    echo -e "${YELLOW}旧内核不会被常规清理自动删除，本操作仅在你确认后执行。${NC}"
-    confirm_action "确认删除以上旧内核吗？" || return 0
+    for package in "${OLD_KERNEL_PACKAGES[@]}"; do
+        if ! printf '%s\n' "${planned_removals[@]}" | grep -Fxq "$package"; then
+            error "模拟删除未包含候选软件包 $package，已停止操作。"
+            return 1
+        fi
+    done
+    return 0
+}
 
+perform_old_kernel_removal() {
+    local result_label="$1"
+    local before
+    local after
+    local current_kernel
+
+    current_kernel=$(uname -r)
     before=$(get_root_used_bytes)
     if apt-get purge -y -- "${OLD_KERNEL_PACKAGES[@]}"; then
+        if [[ ! -e "/boot/vmlinuz-$current_kernel" ]] ||
+           ! dpkg-query -S "/boot/vmlinuz-$current_kernel" >/dev/null 2>&1; then
+            print_result "$result_label" "部分完成" "当前内核引导文件验证失败"
+            error "当前运行内核的引导文件或软件包归属异常，请勿重启并立即检查 /boot。"
+            return 1
+        fi
         if command -v update-grub >/dev/null 2>&1; then
             if update-grub >/dev/null 2>&1; then
                 print_result "GRUB 配置刷新" "已完成"
             else
-                print_result "旧内核" "部分完成" "软件包已删除"
+                print_result "$result_label" "部分完成" "软件包已删除"
                 print_result "GRUB 配置刷新" "失败"
                 error "旧内核软件包已删除，但 update-grub 失败；请修复引导配置后再重启。"
                 return 1
@@ -1729,13 +1788,72 @@ cleanup_old_kernels() {
         else
             print_result "GRUB 配置刷新" "跳过" "未安装 update-grub"
         fi
-        print_result "旧内核" "已完成" "${#OLD_KERNEL_RELEASES[@]} 个版本"
+        print_result "$result_label" "已完成" "${#OLD_KERNEL_RELEASES[@]} 个版本"
     else
-        print_result "旧内核" "失败"
+        print_result "$result_label" "失败"
         return 1
     fi
     after=$(get_root_used_bytes)
     show_released_space "$before" "$after"
+}
+
+cleanup_old_kernels() {
+    package_manager_ready || return 1
+    collect_old_kernel_candidates keep-fallback || return 1
+    if (( ${#OLD_KERNEL_RELEASES[@]} == 0 )); then
+        return 0
+    fi
+    if (( ${#OLD_KERNEL_PACKAGES[@]} == 0 )); then
+        error "已识别旧内核版本，但未找到对应的已安装软件包，已停止操作。"
+        return 1
+    fi
+
+    echo "候选旧内核版本："
+    printf ' - %s\n' "${OLD_KERNEL_RELEASES[@]}"
+    echo "关联软件包："
+    printf ' - %s\n' "${OLD_KERNEL_PACKAGES[@]}"
+    validate_old_kernel_removal_plan || return 1
+
+    echo -e "${YELLOW}旧内核不会被常规清理自动删除，本操作仅在你确认后执行。${NC}"
+    confirm_action "确认删除以上旧内核吗？" || return 0
+    perform_old_kernel_removal "旧内核"
+}
+
+cleanup_all_old_kernels() {
+    local typed_confirmation
+    local expected_current_kernel
+
+    package_manager_ready || return 1
+    expected_current_kernel=$(uname -r)
+    collect_old_kernel_candidates current-only || return 1
+    if (( ${#OLD_KERNEL_RELEASES[@]} == 0 )); then
+        return 0
+    fi
+    if (( ${#OLD_KERNEL_PACKAGES[@]} == 0 )); then
+        error "已识别旧内核版本，但未找到对应的已安装软件包，已停止操作。"
+        return 1
+    fi
+
+    echo -e "${RED}高风险操作：以下全部旧内核将被删除，只保留当前运行内核。${NC}"
+    echo "待删除的旧内核版本："
+    printf ' - %s\n' "${OLD_KERNEL_RELEASES[@]}"
+    echo "关联软件包："
+    printf ' - %s\n' "${OLD_KERNEL_PACKAGES[@]}"
+    validate_old_kernel_removal_plan || return 1
+
+    echo -e "${RED}删除后系统将没有备用内核；当前内核后续若无法启动，只能通过云厂商控制台或救援模式修复。${NC}"
+    confirm_action "确认继续删除所有旧内核吗？" || return 0
+    read -r -p "请输入“删除所有旧内核”进行最终确认: " typed_confirmation
+    if [[ "$typed_confirmation" != "删除所有旧内核" ]]; then
+        warn "确认文字不匹配，已取消操作。"
+        return 0
+    fi
+
+    if [[ -f /var/run/reboot-required ]] || [[ "$(uname -r)" != "$expected_current_kernel" ]]; then
+        error "最终执行前检测到内核状态变化或需要重启，已停止操作。"
+        return 1
+    fi
+    perform_old_kernel_removal "全部旧内核"
 }
 
 cleanup_system_logs() {
@@ -1843,9 +1961,10 @@ submenu_advanced_cleanup() {
         print_menu_item 1 "清理 Snap 旧版本" "$snap_state"
         print_menu_item 2 "清理 Docker 悬空镜像" "$docker_state"
         print_menu_item 3 "清理 Docker 构建缓存" "$docker_state"
+        print_menu_item 4 "删除所有旧内核" "${RED}高风险，仅保留当前内核${NC}"
         echo -e "  ${DIM}0. 返回上一级${NC}"
         echo -e "${CYAN}==================================================${NC}"
-        read -r -p "请输入选项 [0-3]: " choice_advanced
+        read -r -p "请输入选项 [0-4]: " choice_advanced
 
         case "$choice_advanced" in
             1) cleanup_disabled_snaps; pause_menu ;;
@@ -1869,6 +1988,7 @@ submenu_advanced_cleanup() {
                 fi
                 pause_menu
                 ;;
+            4) cleanup_all_old_kernels; pause_menu ;;
             0) return ;;
             *) error "无效输入！"; sleep 1 ;;
         esac
