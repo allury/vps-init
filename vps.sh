@@ -14,7 +14,7 @@ LOG_FILE="/var/log/vps_init.log"
 IPV6_SYSCTL_FILE="/etc/sysctl.d/99-zz-vps-init-ipv6.conf"
 SWAP_SYSCTL_FILE="/etc/sysctl.d/99-zz-vps-init-swap.conf"
 SSH_MANAGED_FILE="/etc/ssh/sshd_config.d/00-00-vps-init.conf"
-VERSION="1.1.5"
+VERSION="1.1.6"
 MANAGED_SWAP_FILE="/swapfile"
 BACKUP_DIR="/var/backups/vps-init"
 
@@ -1408,6 +1408,10 @@ package_manager_ready() {
     fi
 }
 
+parse_apt_simulated_removals() {
+    awk '$1 == "Remv" || $1 == "Purg" {print $2}'
+}
+
 collect_package_cleanup_candidates() {
     local package
     local simulation_output
@@ -1422,7 +1426,9 @@ collect_package_cleanup_candidates() {
         echo "$simulation_output"
         return 1
     fi
-    mapfile -t simulated_packages < <(printf '%s\n' "$simulation_output" | awk '/^Remv / {print $2}')
+    mapfile -t simulated_packages < <(
+        printf '%s\n' "$simulation_output" | parse_apt_simulated_removals
+    )
     for package in "${simulated_packages[@]}"; do
         case "$package" in
             linux-image-*|linux-headers-*|linux-modules-*)
@@ -1740,7 +1746,9 @@ validate_old_kernel_removal_plan() {
         echo "$simulation_output"
         return 1
     fi
-    mapfile -t planned_removals < <(printf '%s\n' "$simulation_output" | awk '/^Remv / {print $2}')
+    mapfile -t planned_removals < <(
+        printf '%s\n' "$simulation_output" | parse_apt_simulated_removals
+    )
     if (( ${#planned_removals[@]} == 0 )); then
         error "删除预览中未发现任何候选软件包，已停止操作。"
         return 1
@@ -3235,6 +3243,8 @@ main_menu() {
 # ==========================================
 # 启动执行
 # ==========================================
-check_os
-check_dependencies
-main_menu
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    check_os
+    check_dependencies
+    main_menu
+fi

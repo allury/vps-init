@@ -3,7 +3,7 @@
 [![Quality](https://github.com/allury/vps-init/actions/workflows/quality.yml/badge.svg)](https://github.com/allury/vps-init/actions/workflows/quality.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-面向 Debian 和 Ubuntu VPS 的交互式初始化与安全加固脚本。当前版本为 **1.1.5**，集中提供系统更新、系统清理、SWAP、时区、SSH、Fail2ban、BBR、DNS 和 IPv6 等常用运维操作。
+面向 Debian 和 Ubuntu VPS 的交互式初始化与安全加固脚本。当前版本为 **1.1.6**，集中提供系统更新、系统清理、SWAP、时区、SSH、Fail2ban、BBR、DNS 和 IPv6 等常用运维操作。
 
 > [!WARNING]
 > 本项目会修改 SSH、网络、内核及系统服务配置。运行前请创建快照、确认云厂商控制台可用，并保留一个已登录的备用会话。请先在测试实例验证，再用于生产环境。
@@ -22,6 +22,11 @@
 - Ubuntu 24.04+ `ssh.socket` 处理、真实监听端口检测和 Fail2ban 端口同步
 - BBR、SSH、DNS、IPv6、SWAP 与 Fail2ban 关键状态汇总
 - 旧内核安全保留清理，以及仅保留当前运行内核的高风险高级清理
+
+## 1.1.6 更新
+
+- 修复 APT 模拟清除使用 `Purg` 标记时未能识别候选软件包的问题，使旧内核删除预览可以在 Debian 13 等环境中正确执行。
+- 常规无用软件包清理与旧内核清理统一解析 `Remv` 和 `Purg`，继续保留模拟结果白名单与异常中止保护。
 
 ## 1.1.5 更新
 

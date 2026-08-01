@@ -25,6 +25,19 @@ jobs:
       - name: Check Bash syntax
         run: bash -n vps.sh
 
+      - name: Test APT simulation parser
+        run: |
+          source ./vps.sh
+          actual="$(
+            printf '%s\n' \
+              'Remv unused-package [1.0]' \
+              'Purg old-kernel [6.12]' \
+              'Inst unrelated-package (2.0 stable [amd64])' |
+              parse_apt_simulated_removals
+          )"
+          expected=$'unused-package\nold-kernel'
+          test "$actual" = "$expected"
+
       - name: Install ShellCheck
         run: |
           sudo apt-get update
