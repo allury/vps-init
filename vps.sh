@@ -10,11 +10,14 @@ CYAN=''
 BOLD=''
 DIM=''
 NC=''
-LOG_FILE="/var/log/vps_init.log"
+LOG_FILE="${VPS_INIT_LOG_FILE:-/var/log/vps_init.log}"
+LOG_MAX_BYTES="${VPS_INIT_LOG_MAX_BYTES:-1048576}"
+LOG_KEEP_LINES="${VPS_INIT_LOG_KEEP_LINES:-1000}"
+LOG_DETAIL_LIMIT=2048
 IPV6_SYSCTL_FILE="/etc/sysctl.d/99-zz-vps-init-ipv6.conf"
 SWAP_SYSCTL_FILE="/etc/sysctl.d/99-zz-vps-init-swap.conf"
 SSH_MANAGED_FILE="/etc/ssh/sshd_config.d/00-00-vps-init.conf"
-VERSION="1.1.6"
+VERSION="1.1.7"
 MANAGED_SWAP_FILE="/swapfile"
 BACKUP_DIR="/var/backups/vps-init"
 
@@ -28,22 +31,101 @@ if [[ -t 1 && "${TERM:-}" != "dumb" && -z "${NO_COLOR:-}" ]]; then
     NC='\033[0m'
 fi
 
-touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/vps_init.log"
+initialize_log_file() {
+    local fallback_file="/tmp/vps_init-${EUID}.log"
+
+    [[ "$LOG_MAX_BYTES" =~ ^[0-9]+$ ]] || LOG_MAX_BYTES=1048576
+    [[ "$LOG_KEEP_LINES" =~ ^[0-9]+$ ]] || LOG_KEEP_LINES=1000
+    (( LOG_MAX_BYTES > 0 )) || LOG_MAX_BYTES=1048576
+    (( LOG_KEEP_LINES > 0 )) || LOG_KEEP_LINES=1000
+
+    if [[ -L "$LOG_FILE" ]] || ! touch "$LOG_FILE" 2>/dev/null; then
+        LOG_FILE="$fallback_file"
+        if [[ -L "$LOG_FILE" ]] || ! touch "$LOG_FILE" 2>/dev/null; then
+            LOG_FILE="/dev/null"
+            return 0
+        fi
+    fi
+    chmod 600 "$LOG_FILE" 2>/dev/null || true
+}
+
+compact_log_file() {
+    local current_size
+    local temp_file
+
+    [[ "$LOG_FILE" != "/dev/null" && -f "$LOG_FILE" ]] || return 0
+    current_size=$(wc -c < "$LOG_FILE" 2>/dev/null) || return 0
+    (( current_size > LOG_MAX_BYTES )) || return 0
+    command -v mktemp >/dev/null 2>&1 || return 0
+
+    temp_file=$(mktemp "${LOG_FILE}.vps-init.XXXXXX") || return 0
+    if tail -n "$LOG_KEEP_LINES" "$LOG_FILE" 2>/dev/null | \
+       tail -c "$LOG_MAX_BYTES" > "$temp_file" 2>/dev/null; then
+        chmod 600 "$temp_file" 2>/dev/null || true
+        mv -f -- "$temp_file" "$LOG_FILE" 2>/dev/null || rm -f -- "$temp_file"
+    else
+        rm -f -- "$temp_file"
+    fi
+}
+
+sanitize_log_message() {
+    printf '%s' "$1" | sed -E 's/\x1B\[[0-9;]*[mK]//g' | tr '\r\n' '  '
+}
+
+append_log_line() {
+    local timestamp="$1"
+    local level="$2"
+    local message="$3"
+    local clean_message
+
+    clean_message=$(sanitize_log_message "$message")
+    if [[ -n "$level" ]]; then
+        printf '[%s] [%s] %s\n' "$timestamp" "$level" "$clean_message" >> "$LOG_FILE"
+    else
+        printf '[%s] %s\n' "$timestamp" "$clean_message" >> "$LOG_FILE"
+    fi
+}
 
 log() {
-    echo -e "${GREEN}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} $1"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | sed -r 's/\x1B\[[0-9;]*[mK]//g' >> "$LOG_FILE"
+    local timestamp
+
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo -e "${GREEN}[$timestamp]${NC} $1"
+    append_log_line "$timestamp" "" "$1"
 }
 
 error() {
+    local timestamp
+
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     echo -e "${RED}[错误]${NC} $1"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $1" | sed -r 's/\x1B\[[0-9;]*[mK]//g' >> "$LOG_FILE"
+    append_log_line "$timestamp" "ERROR" "$1"
 }
 
 warn() {
+    local timestamp
+
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     echo -e "${YELLOW}[注意]${NC} $1"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] $1" | sed -r 's/\x1B\[[0-9;]*[mK]//g' >> "$LOG_FILE"
+    append_log_line "$timestamp" "WARN" "$1"
 }
+
+detail() {
+    local module="$1"
+    local stage="$2"
+    local message="$3"
+    local timestamp
+    local clean_message
+
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    clean_message=$(sanitize_log_message "$message")
+    clean_message="${clean_message:0:LOG_DETAIL_LIMIT}"
+    printf '[%s] [DETAIL] [%s][%s] %s\n' \
+        "$timestamp" "$module" "$stage" "$clean_message" >> "$LOG_FILE"
+}
+
+initialize_log_file
+compact_log_file
 
 pause_menu() {
     read -r -p "按回车键继续..."
@@ -646,6 +728,7 @@ persist_bbr_settings() {
     }
 
     [[ "$write_bbr" == "0" ]] && result_label="FQ"
+    detail "BBR" "DETECT" "目标=$SYSCTL_TARGET；写入 BBR=$write_bbr；原拥塞控制=${previous_cc:-未知}；原队列=${previous_qdisc:-未知}"
 
     if ! mkdir -p "$(dirname "$SYSCTL_TARGET")" "$BACKUP_DIR"; then
         error "无法创建 sysctl 配置或备份目录。"
@@ -684,6 +767,9 @@ persist_bbr_settings() {
         fi
     fi
 
+    effective_qdisc=$(get_effective_sysctl_value net.core.default_qdisc)
+    effective_cc=$(get_effective_sysctl_value net.ipv4.tcp_congestion_control)
+    detail "BBR" "VERIFY" "目标=$SYSCTL_TARGET；期望队列=fq；期望拥塞控制=$([[ "$write_bbr" == "1" ]] && printf bbr || printf 保持不变)；持久化队列=${effective_qdisc:-未定义}；持久化拥塞控制=${effective_cc:-未定义}；运行队列=$(sysctl -n net.core.default_qdisc 2>/dev/null || printf 未知)；运行拥塞控制=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf 未知)"
     if [[ "$target_existed" == "1" ]]; then
         cp -a "$backup_file" "$SYSCTL_TARGET" || rollback_failed=1
     else
@@ -698,8 +784,10 @@ persist_bbr_settings() {
         [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "$previous_cc" ]] || rollback_failed=1
     fi
     if [[ "$rollback_failed" == "0" ]]; then
+        detail "BBR" "ROLLBACK" "配置文件和运行参数恢复成功；目标=$SYSCTL_TARGET"
         error "$result_label 应用失败，配置文件和运行参数已回滚。"
     else
+        detail "BBR" "ROLLBACK" "自动恢复不完整；目标=$SYSCTL_TARGET；备份=${backup_file:-无}"
         error "$result_label 应用失败且自动回滚不完整，请使用备份 ${backup_file:-$SYSCTL_TARGET} 手动恢复。"
     fi
     return 1
@@ -779,6 +867,7 @@ begin_ssh_transaction() {
         SSH_MANAGED_EXISTED=1
         cp -a "$SSH_MANAGED_FILE" "$SSH_BACKUP_PATH/managed.conf" || return 1
     fi
+    detail "SSH" "BACKUP" "备份=$SSH_BACKUP_PATH；托管文件原先存在=$SSH_MANAGED_EXISTED；ssh.service 启用=$SSH_SERVICE_ENABLED/运行=$SSH_SERVICE_ACTIVE；ssh.socket 启用=$SSH_SOCKET_ENABLED/运行=$SSH_SOCKET_ACTIVE"
 }
 
 restore_unit_enablement() {
@@ -842,10 +931,18 @@ restore_ssh_transaction() {
 
 rollback_ssh_with_message() {
     local message="$1"
+    local configured_port
+    local listening_ports
+
+    configured_port=$(get_ssh_port)
+    listening_ports=$(get_listening_ssh_ports)
+    detail "SSH" "ROLLBACK" "触发原因=$message；配置端口=${configured_port:-未知}；监听端口=${listening_ports:-未检测到}；ssh.service=$(systemctl is-active ssh.service 2>/dev/null || printf 未知)；ssh.socket=$(systemctl is-active ssh.socket 2>/dev/null || printf 未知)；备份=$SSH_BACKUP_PATH"
 
     if restore_ssh_transaction; then
+        detail "SSH" "ROLLBACK" "SSH 配置及 service/socket 状态恢复成功"
         error "$message，SSH 配置与 socket/service 状态已回滚。"
     else
+        detail "SSH" "ROLLBACK" "SSH 自动恢复不完整；备份=$SSH_BACKUP_PATH"
         error "$message，自动回滚未完全成功，请从 $SSH_BACKUP_PATH 手动恢复。"
     fi
 }
@@ -933,6 +1030,7 @@ begin_swap_transaction() {
         SWAP_SYSCTL_EXISTED=1
         cp -a "$SWAP_SYSCTL_FILE" "$SWAP_BACKUP_PATH/swappiness.conf" || return 1
     fi
+    detail "SWAP" "BACKUP" "备份=$SWAP_BACKUP_PATH；文件=$MANAGED_SWAP_FILE；活动=$(swapon --show=NAME --noheadings --raw 2>/dev/null | grep -Fxq "$MANAGED_SWAP_FILE" && printf 是 || printf 否)；原 swappiness=${SWAP_PREVIOUS_SWAPPINESS:-未知}；托管配置原先存在=$SWAP_SYSCTL_EXISTED"
 }
 
 restore_swap_persistence() {
@@ -955,6 +1053,8 @@ rollback_swap_creation() {
     local failed=0
     local can_remove=1
 
+    detail "SWAP" "ROLLBACK_CREATE" "开始回滚未完成的 SWAP 创建；文件=$MANAGED_SWAP_FILE；备份=$SWAP_BACKUP_PATH"
+
     if swapon --show=NAME --noheadings --raw 2>/dev/null | grep -Fxq "$MANAGED_SWAP_FILE"; then
         if ! swapoff "$MANAGED_SWAP_FILE" >/dev/null 2>&1; then
             failed=1
@@ -967,9 +1067,11 @@ rollback_swap_creation() {
     fi
     restore_swap_persistence || failed=1
     if [[ "$failed" == "1" ]]; then
+        detail "SWAP" "ROLLBACK_CREATE" "自动恢复不完整；文件存在=$([[ -e "$MANAGED_SWAP_FILE" ]] && printf 是 || printf 否)；备份=$SWAP_BACKUP_PATH"
         error "SWAP 自动回滚未完全成功，请从 $SWAP_BACKUP_PATH 手动恢复。"
         return 1
     fi
+    detail "SWAP" "ROLLBACK_CREATE" "fstab、swappiness 和托管 SWAP 文件恢复成功"
     warn "未完成的 SWAP 创建已回滚，fstab、swappiness 与 /swapfile 已恢复。"
     return 0
 }
@@ -978,10 +1080,17 @@ rollback_swap_removal() {
     local was_active="$1"
     local failed=0
 
+    detail "SWAP" "ROLLBACK_REMOVE" "开始恢复 SWAP 删除操作；原活动=$was_active；备份=$SWAP_BACKUP_PATH"
+
     restore_swap_persistence || failed=1
     if [[ "$was_active" == "1" ]] && \
        ! swapon --show=NAME --noheadings --raw 2>/dev/null | grep -Fxq "$MANAGED_SWAP_FILE"; then
         swapon "$MANAGED_SWAP_FILE" >/dev/null 2>&1 || failed=1
+    fi
+    if [[ "$failed" == "0" ]]; then
+        detail "SWAP" "ROLLBACK_REMOVE" "fstab、swappiness 和运行状态恢复成功"
+    else
+        detail "SWAP" "ROLLBACK_REMOVE" "自动恢复不完整；备份=$SWAP_BACKUP_PATH"
     fi
     return "$failed"
 }
@@ -2368,25 +2477,58 @@ restore_dns_files() {
     local index
     local target
     local failed=0
+    local command_output
+    local command_status
+
+    detail "DNS" "ROLLBACK" "开始恢复 ${#DNS_CHANGED_FILES[@]} 个配置项；备份目录=$DNS_BACKUP_PATH"
 
     for (( index=${#DNS_CHANGED_FILES[@]}-1; index>=0; index-- )); do
         target="${DNS_CHANGED_FILES[$index]}"
         [[ "$target" == "/etc/resolv.conf" ]] && chattr -i "$target" >/dev/null 2>&1 || true
-        rm -f -- "$target" || failed=1
+        if ! rm -f -- "$target"; then
+            detail "DNS" "ROLLBACK" "无法移除待恢复文件：$target"
+            failed=1
+        fi
         if [[ "${DNS_FILE_EXISTED[$index]}" == "1" ]]; then
-            mkdir -p "$(dirname "$target")" || failed=1
-            cp -a -- "${DNS_BACKUP_FILES[$index]}" "$target" || failed=1
+            if ! mkdir -p "$(dirname "$target")" || \
+               ! cp -a -- "${DNS_BACKUP_FILES[$index]}" "$target"; then
+                detail "DNS" "ROLLBACK" "文件恢复失败：目标=$target，备份=${DNS_BACKUP_FILES[$index]}"
+                failed=1
+            fi
         fi
     done
 
     if [[ "$DNS_NETPLAN_APPLIED" == "1" ]] && command -v netplan >/dev/null 2>&1; then
-        netplan generate >/dev/null 2>&1 && timeout 30 netplan apply >/dev/null 2>&1 || failed=1
+        command_output=$(netplan generate 2>&1)
+        command_status=$?
+        if (( command_status != 0 )); then
+            detail "DNS" "ROLLBACK_NETPLAN" "netplan generate 失败，退出码=$command_status，输出=${command_output:-无}"
+            failed=1
+        else
+            command_output=$(timeout 30 netplan apply 2>&1)
+            command_status=$?
+            if (( command_status != 0 )); then
+                detail "DNS" "ROLLBACK_NETPLAN" "netplan apply 失败，退出码=$command_status，输出=${command_output:-无}"
+                failed=1
+            fi
+        fi
     fi
     if [[ "$DNS_RESOLVED_ACTIVE" == "1" ]]; then
-        timeout 30 systemctl restart systemd-resolved >/dev/null 2>&1 || failed=1
+        command_output=$(timeout 30 systemctl restart systemd-resolved 2>&1)
+        command_status=$?
+        if (( command_status != 0 )); then
+            detail "DNS" "ROLLBACK_RESOLVED" "systemd-resolved 重启失败，退出码=$command_status，输出=${command_output:-无}"
+            failed=1
+        fi
     fi
     if [[ "$DNS_RESOLV_WAS_IMMUTABLE" == "1" ]] && ! chattr +i /etc/resolv.conf >/dev/null 2>&1; then
+        detail "DNS" "ROLLBACK_RESOLV_CONF" "无法恢复 /etc/resolv.conf 的不可变属性"
         failed=1
+    fi
+    if [[ "$failed" == "0" ]]; then
+        detail "DNS" "ROLLBACK" "配置文件及相关服务状态恢复成功"
+    else
+        detail "DNS" "ROLLBACK" "恢复流程存在失败项，请使用备份目录手动核对"
     fi
     return "$failed"
 }
@@ -2394,6 +2536,7 @@ restore_dns_files() {
 rollback_dns_with_message() {
     local message="$1"
 
+    detail "DNS" "ROLLBACK" "触发原因=$message；备份目录=$DNS_BACKUP_PATH"
     if restore_dns_files; then
         error "$message，原 DNS 配置已恢复。"
     else
@@ -2473,6 +2616,8 @@ sync_netplan_dns() {
     local override_file="/etc/netplan/99-vps-init-dns.yaml"
     local dhcp4
     local dhcp6
+    local command_output
+    local command_status
 
     command -v netplan >/dev/null 2>&1 || return 0
     [[ -d /etc/netplan ]] || return 0
@@ -2508,8 +2653,19 @@ sync_netplan_dns() {
     } > "$override_file" || return 1
     chmod 600 "$override_file" || return 1
     DNS_NETPLAN_APPLIED=1
-    netplan generate >/dev/null 2>&1 || return 1
-    timeout 30 netplan apply >/dev/null 2>&1 || return 1
+    command_output=$(netplan generate 2>&1)
+    command_status=$?
+    if (( command_status != 0 )); then
+        detail "DNS" "APPLY_NETPLAN" "netplan generate 失败，退出码=$command_status，输出=${command_output:-无}"
+        return 1
+    fi
+    command_output=$(timeout 30 netplan apply 2>&1)
+    command_status=$?
+    if (( command_status != 0 )); then
+        detail "DNS" "APPLY_NETPLAN" "netplan apply 失败，退出码=$command_status，输出=${command_output:-无}"
+        return 1
+    fi
+    detail "DNS" "APPLY_NETPLAN" "接口=$default_iface；配置=$override_file；DHCPv4=$dhcp4；DHCPv6=$dhcp6；DNS=$dns_csv"
     log "已通过 netplan 为 $default_iface 同步 DNS。"
 }
 
@@ -2579,6 +2735,16 @@ dns_link_uses_requested_servers() {
     return 0
 }
 
+dns_verify_fail() {
+    local stage="$1"
+    local summary="$2"
+    local diagnostics="${3:-$summary}"
+
+    DNS_VERIFY_FAILURE="$summary"
+    detail "DNS" "$stage" "$diagnostics"
+    return 1
+}
+
 verify_dns_change() {
     local requested_dns="$1"
     local route_after
@@ -2587,46 +2753,110 @@ verify_dns_change() {
     local link_output
     local resolv_servers
     local default_iface
+    local command_status
+    local github_status
+    local cloudflare_status
+
+    DNS_VERIFY_FAILURE=""
+    detail "DNS" "VERIFY_START" "请求=$requested_dns；IPv4接口=${DNS_DEFAULT_V4_IFACE_BEFORE:-无}；IPv4网关=${DNS_DEFAULT_V4_GATEWAY_BEFORE:-无}；IPv6接口=${DNS_DEFAULT_V6_IFACE_BEFORE:-无}；IPv6网关=${DNS_DEFAULT_V6_GATEWAY_BEFORE:-无}"
 
     if [[ -n "$DNS_DEFAULT_V4_IFACE_BEFORE" ]]; then
         route_after=$(ip -o -4 route show default dev "$DNS_DEFAULT_V4_IFACE_BEFORE" 2>/dev/null)
-        [[ -n "$route_after" ]] || return 1
+        if [[ -z "$route_after" ]]; then
+            dns_verify_fail "VERIFY_ROUTE_V4" \
+                "IPv4 默认路由丢失（接口 $DNS_DEFAULT_V4_IFACE_BEFORE）" \
+                "接口=$DNS_DEFAULT_V4_IFACE_BEFORE；修改前网关=${DNS_DEFAULT_V4_GATEWAY_BEFORE:-无}；修改后未发现默认路由"
+            return 1
+        fi
         if [[ -n "$DNS_DEFAULT_V4_GATEWAY_BEFORE" ]] && \
            ! grep -Fq "via $DNS_DEFAULT_V4_GATEWAY_BEFORE " <<< "$route_after"; then
+            dns_verify_fail "VERIFY_ROUTE_V4" \
+                "IPv4 默认网关发生变化" \
+                "期望网关=$DNS_DEFAULT_V4_GATEWAY_BEFORE；实际路由=$route_after"
             return 1
         fi
     fi
     if [[ -n "$DNS_DEFAULT_V6_IFACE_BEFORE" ]]; then
         route_after=$(ip -o -6 route show default dev "$DNS_DEFAULT_V6_IFACE_BEFORE" 2>/dev/null)
-        [[ -n "$route_after" ]] || return 1
+        if [[ -z "$route_after" ]]; then
+            dns_verify_fail "VERIFY_ROUTE_V6" \
+                "IPv6 默认路由丢失（接口 $DNS_DEFAULT_V6_IFACE_BEFORE）" \
+                "接口=$DNS_DEFAULT_V6_IFACE_BEFORE；修改前网关=${DNS_DEFAULT_V6_GATEWAY_BEFORE:-无}；修改后未发现默认路由"
+            return 1
+        fi
         if [[ -n "$DNS_DEFAULT_V6_GATEWAY_BEFORE" ]] && \
            ! grep -Fq "via $DNS_DEFAULT_V6_GATEWAY_BEFORE " <<< "$route_after"; then
+            dns_verify_fail "VERIFY_ROUTE_V6" \
+                "IPv6 默认网关发生变化" \
+                "期望网关=$DNS_DEFAULT_V6_GATEWAY_BEFORE；实际路由=$route_after"
             return 1
         fi
     fi
     if systemctl is-active systemd-resolved >/dev/null 2>&1 && command -v resolvectl >/dev/null 2>&1; then
-        resolved_output=$(resolvectl dns 2>/dev/null) || return 1
+        resolved_output=$(resolvectl dns 2>&1)
+        command_status=$?
+        if (( command_status != 0 )); then
+            dns_verify_fail "VERIFY_RESOLVED" \
+                "无法读取 systemd-resolved 的 DNS 状态" \
+                "resolvectl dns 退出码=$command_status；输出=${resolved_output:-无}"
+            return 1
+        fi
         for dns_server in $requested_dns; do
-            dns_text_has_server "$resolved_output" "$dns_server" || return 1
+            if ! dns_text_has_server "$resolved_output" "$dns_server"; then
+                dns_verify_fail "VERIFY_SERVER" \
+                    "请求的 DNS $dns_server 未出现在 systemd-resolved 状态中" \
+                    "缺少=$dns_server；请求=$requested_dns；实际=${resolved_output:-无}"
+                return 1
+            fi
         done
         for default_iface in "$DNS_DEFAULT_V4_IFACE_BEFORE" "$DNS_DEFAULT_V6_IFACE_BEFORE"; do
             [[ -n "$default_iface" ]] || continue
-            link_output=$(resolvectl dns "$default_iface" 2>/dev/null) || return 1
-            dns_link_uses_requested_servers "$link_output" "$requested_dns" || return 1
+            link_output=$(resolvectl dns "$default_iface" 2>&1)
+            command_status=$?
+            if (( command_status != 0 )); then
+                dns_verify_fail "VERIFY_LINK_SERVER" \
+                    "无法读取接口 $default_iface 的 DNS 状态" \
+                    "接口=$default_iface；resolvectl 退出码=$command_status；输出=${link_output:-无}"
+                return 1
+            fi
+            if ! dns_link_uses_requested_servers "$link_output" "$requested_dns"; then
+                dns_verify_fail "VERIFY_LINK_SERVER" \
+                    "接口 $default_iface 仍包含未请求的 DNS" \
+                    "接口=$default_iface；请求=$requested_dns；实际=${link_output:-无}"
+                return 1
+            fi
         done
     else
         resolv_servers=$(awk '/^[[:space:]]*nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf 2>/dev/null)
         for dns_server in $requested_dns; do
-            dns_address_in_list "$dns_server" "$resolv_servers" || return 1
+            if ! dns_address_in_list "$dns_server" "$resolv_servers"; then
+                dns_verify_fail "VERIFY_RESOLV_CONF" \
+                    "请求的 DNS $dns_server 未写入 resolv.conf" \
+                    "缺少=$dns_server；请求=$requested_dns；实际=${resolv_servers:-无}"
+                return 1
+            fi
         done
         while IFS= read -r dns_server; do
             [[ -z "$dns_server" ]] && continue
-            dns_address_in_list "$dns_server" "$requested_dns" || return 1
+            if ! dns_address_in_list "$dns_server" "$requested_dns"; then
+                dns_verify_fail "VERIFY_RESOLV_CONF" \
+                    "resolv.conf 仍包含未请求的 DNS $dns_server" \
+                    "未请求=$dns_server；请求=$requested_dns；实际=$resolv_servers"
+                return 1
+            fi
         done <<< "$resolv_servers"
     fi
 
-    timeout 10 getent ahosts github.com >/dev/null 2>&1 || \
-        timeout 10 getent ahosts cloudflare.com >/dev/null 2>&1
+    timeout 10 getent ahosts github.com >/dev/null 2>&1
+    github_status=$?
+    (( github_status == 0 )) && return 0
+    timeout 10 getent ahosts cloudflare.com >/dev/null 2>&1
+    cloudflare_status=$?
+    (( cloudflare_status == 0 )) && return 0
+
+    dns_verify_fail "VERIFY_RESOLVE" \
+        "域名解析验证失败" \
+        "github.com 退出码=$github_status；cloudflare.com 退出码=$cloudflare_status；请求 DNS=$requested_dns"
 }
 
 apply_dns_servers() {
@@ -2634,6 +2864,8 @@ apply_dns_servers() {
     local dns_csv="${dns_line// /, }"
     local dns_server
     local resolved_file="/etc/systemd/resolved.conf.d/99-vps-init-dns.conf"
+    local command_output
+    local command_status
 
     for dns_server in $dns_line; do
         if ! validate_dns_address "$dns_server"; then
@@ -2653,9 +2885,19 @@ apply_dns_servers() {
     DNS_NETPLAN_APPLIED=0
     DNS_RESOLVED_ACTIVE=0
     DNS_RESOLV_WAS_IMMUTABLE=0
-    mkdir -p "$DNS_BACKUP_PATH" || return 1
+    if ! mkdir -p "$DNS_BACKUP_PATH"; then
+        error "无法创建 DNS 备份目录：$DNS_BACKUP_PATH"
+        return 1
+    fi
+    detail "DNS" "DETECT" "请求=$dns_line；IPv4接口=${DNS_DEFAULT_V4_IFACE_BEFORE:-无}；IPv4网关=${DNS_DEFAULT_V4_GATEWAY_BEFORE:-无}；IPv6接口=${DNS_DEFAULT_V6_IFACE_BEFORE:-无}；IPv6网关=${DNS_DEFAULT_V6_GATEWAY_BEFORE:-无}；备份=$DNS_BACKUP_PATH"
 
-    if ! sync_interfaces_dns "$dns_line" || ! sync_netplan_dns "$dns_csv"; then
+    if ! sync_interfaces_dns "$dns_line"; then
+        detail "DNS" "WRITE_INTERFACES" "interfaces 持久化配置写入失败；请求=$dns_line"
+        rollback_dns_with_message "DNS interfaces 持久化配置写入失败"
+        return 1
+    fi
+    if ! sync_netplan_dns "$dns_csv"; then
+        detail "DNS" "WRITE_NETPLAN" "netplan 持久化配置写入或应用失败；请求=$dns_line"
         rollback_dns_with_message "DNS 持久化配置写入失败"
         return 1
     fi
@@ -2683,10 +2925,14 @@ EOF
             rollback_dns_with_message "systemd-resolved 配置写入失败"
             return 1
         fi
-        if ! timeout 30 systemctl restart systemd-resolved; then
+        command_output=$(timeout 30 systemctl restart systemd-resolved 2>&1)
+        command_status=$?
+        if (( command_status != 0 )); then
+            detail "DNS" "APPLY_RESOLVED" "systemd-resolved 重启失败，退出码=$command_status，输出=${command_output:-无}"
             rollback_dns_with_message "systemd-resolved 重启失败"
             return 1
         fi
+        detail "DNS" "APPLY_RESOLVED" "配置=$resolved_file；DNS=$dns_line；服务重启成功"
     else
         backup_dns_file /etc/resolv.conf || {
             rollback_dns_with_message "resolv.conf 备份失败"
@@ -2715,7 +2961,7 @@ EOF
     fi
 
     if ! verify_dns_change "$dns_line"; then
-        rollback_dns_with_message "DNS 应用后目标服务器、默认路由或域名解析验证失败"
+        rollback_dns_with_message "DNS 应用后验证失败：${DNS_VERIFY_FAILURE:-未知原因}"
         return 1
     fi
 
@@ -2861,10 +3107,20 @@ restore_ipv6_transaction() {
 verify_ipv6_runtime_state() {
     local target_value="$1"
     local runtime_path
+    local runtime_value
+
+    IPV6_VERIFY_FAILURE=""
 
     for runtime_path in "${IPV6_RUNTIME_PATHS[@]}"; do
-        [[ -r "$runtime_path" ]] || return 1
-        [[ "$(<"$runtime_path")" == "$target_value" ]] || return 1
+        if [[ ! -r "$runtime_path" ]]; then
+            IPV6_VERIFY_FAILURE="运行状态不可读：$runtime_path"
+            return 1
+        fi
+        runtime_value=$(<"$runtime_path")
+        if [[ "$runtime_value" != "$target_value" ]]; then
+            IPV6_VERIFY_FAILURE="运行状态不一致：$runtime_path 期望=$target_value 实际=$runtime_value"
+            return 1
+        fi
     done
 }
 
@@ -2879,6 +3135,7 @@ configure_ipv6_state() {
     IPV6_FILE_EXISTED=0
     IPV6_RUNTIME_PATHS=()
     IPV6_RUNTIME_VALUES=()
+    IPV6_VERIFY_FAILURE=""
     IPV6_PREVIOUS_ALL=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
     IPV6_PREVIOUS_DEFAULT=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null)
     IPV6_PREVIOUS_LO=$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null)
@@ -2895,6 +3152,7 @@ configure_ipv6_state() {
         error "无法读取当前 IPv6 内核状态，未修改配置。"
         return 1
     fi
+    detail "IPV6" "DETECT" "操作=$action_label；目标值=$target_value；原 all=$IPV6_PREVIOUS_ALL；原 default=$IPV6_PREVIOUS_DEFAULT；原 lo=$IPV6_PREVIOUS_LO；运行路径数=${#IPV6_RUNTIME_PATHS[@]}；配置=$IPV6_SYSCTL_FILE"
     if [[ -L "$IPV6_SYSCTL_FILE" ]]; then
         error "$IPV6_SYSCTL_FILE 是符号链接，为避免修改未知目标已停止操作。"
         return 1
@@ -2920,9 +3178,12 @@ configure_ipv6_state() {
        [[ "$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null)" != "$target_value" ]] || \
        [[ "$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null)" != "$target_value" ]] || \
        ! verify_ipv6_runtime_state "$target_value"; then
+        detail "IPV6" "VERIFY" "操作=$action_label；原因=${IPV6_VERIFY_FAILURE:-写入、持久化顺序或 sysctl 运行值验证失败}；持久化 all=$(get_effective_sysctl_value net.ipv6.conf.all.disable_ipv6)；持久化 default=$(get_effective_sysctl_value net.ipv6.conf.default.disable_ipv6)；持久化 lo=$(get_effective_sysctl_value net.ipv6.conf.lo.disable_ipv6)；运行 all=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || printf 未知)；运行 default=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || printf 未知)；运行 lo=$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null || printf 未知)"
         if restore_ipv6_transaction; then
+            detail "IPV6" "ROLLBACK" "配置文件和运行参数恢复成功；备份=$IPV6_BACKUP_PATH"
             error "IPv6 $action_label失败，配置文件与运行参数已回滚。"
         else
+            detail "IPV6" "ROLLBACK" "自动恢复不完整；备份=$IPV6_BACKUP_PATH"
             error "IPv6 $action_label失败且自动回滚不完整，请从 $IPV6_BACKUP_PATH 手动恢复。"
         fi
         return 1
