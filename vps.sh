@@ -14,10 +14,12 @@ LOG_FILE="${VPS_INIT_LOG_FILE:-/var/log/vps_init.log}"
 LOG_MAX_BYTES="${VPS_INIT_LOG_MAX_BYTES:-1048576}"
 LOG_KEEP_LINES="${VPS_INIT_LOG_KEEP_LINES:-1000}"
 LOG_DETAIL_LIMIT=2048
+DNS_ROUTE_V4_WAIT_SECONDS="${VPS_INIT_DNS_ROUTE_V4_WAIT_SECONDS:-10}"
+DNS_ROUTE_V6_WAIT_SECONDS="${VPS_INIT_DNS_ROUTE_V6_WAIT_SECONDS:-30}"
 IPV6_SYSCTL_FILE="/etc/sysctl.d/99-zz-vps-init-ipv6.conf"
 SWAP_SYSCTL_FILE="/etc/sysctl.d/99-zz-vps-init-swap.conf"
 SSH_MANAGED_FILE="/etc/ssh/sshd_config.d/00-00-vps-init.conf"
-VERSION="1.1.7"
+VERSION="1.1.8"
 MANAGED_SWAP_FILE="/swapfile"
 BACKUP_DIR="/var/backups/vps-init"
 
@@ -136,7 +138,11 @@ confirm_action() {
     local answer
 
     read -r -p "$prompt [y/N]: " answer
-    [[ "$answer" == "y" || "$answer" == "Y" ]]
+    if [[ "$answer" == "y" || "$answer" == "Y" ]]; then
+        return 0
+    fi
+    print_result "操作" "已取消" "未做任何更改"
+    return 1
 }
 
 require_commands() {
@@ -187,6 +193,26 @@ print_result() {
     esac
     printf '  %-22s ' "$label"
     echo -e "${color}${state}${NC}${detail:+  $detail}"
+}
+
+action_success() {
+    local label="$1"
+    local detail_text="${2:-}"
+    local timestamp
+
+    print_result "$label" "已完成" "$detail_text"
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    append_log_line "$timestamp" "" "$label 已完成${detail_text:+：$detail_text}"
+}
+
+action_partial() {
+    local label="$1"
+    local detail_text="$2"
+    local timestamp
+
+    print_result "$label" "部分完成" "$detail_text"
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    append_log_line "$timestamp" "WARN" "$label 部分完成：$detail_text"
 }
 
 get_ssh_port() {
@@ -405,8 +431,9 @@ update_fail2ban_sshd_jail() {
         return 1
     fi
 
-    log "Fail2ban [sshd] 配置已在 $target_file 中增量更新并通过测试。备份：$backup_path"
-    [[ "$legacy_existed" == "1" ]] && log "旧版独立端口文件已迁移并移除：$legacy_file"
+    detail "FAIL2BAN" "VERIFY" "配置=$target_file；端口=$port；模式=$mode；测试通过；备份=$backup_path"
+    [[ "$legacy_existed" == "1" ]] && \
+        detail "FAIL2BAN" "MIGRATE" "旧版独立端口文件已迁移并移除：$legacy_file"
     return 0
 }
 
@@ -417,9 +444,9 @@ sync_fail2ban_ssh_port() {
         return 0
     fi
     if update_fail2ban_sshd_jail "$port" port; then
-        log "Fail2ban 已同步 SSH 端口 $port。"
+        detail "FAIL2BAN" "SYNC_PORT" "SSH 端口已同步为 $port"
     else
-        error "SSH 已切换到端口 $port，但 Fail2ban 端口同步失败；请检查现有 jail.local。"
+        detail "FAIL2BAN" "SYNC_PORT" "SSH 已切换到端口 $port，但 Fail2ban 端口同步失败"
         return 1
     fi
 }
@@ -528,17 +555,24 @@ choose_path_interactively() {
     local index
     local choice
 
-    echo "$prompt"
-    for index in "${!candidates[@]}"; do
-        printf ' %d. %s\n' "$((index + 1))" "${candidates[$index]}"
+    while true; do
+        echo "$prompt"
+        for index in "${!candidates[@]}"; do
+            printf ' %d. %s\n' "$((index + 1))" "${candidates[$index]}"
+        done
+        echo " 0. 取消"
+        read -r -p "请选择配置文件: " choice
+        if [[ "$choice" == "0" ]]; then
+            SYSCTL_TARGET=""
+            print_result "BBR / FQ" "已取消" "未修改任何 sysctl 文件"
+            return 1
+        fi
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#candidates[@]} )); then
+            SYSCTL_TARGET="${candidates[$((choice - 1))]}"
+            return 0
+        fi
+        error "无效的配置文件选项，请重新选择。"
     done
-    echo " 0. 取消"
-    read -r -p "请选择配置文件: " choice
-    if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#candidates[@]} )); then
-        SYSCTL_TARGET=""
-        return 1
-    fi
-    SYSCTL_TARGET="${candidates[$((choice - 1))]}"
 }
 
 select_sysctl_target() {
@@ -722,10 +756,7 @@ persist_bbr_settings() {
     local effective_qdisc
     local rollback_failed=0
 
-    select_sysctl_target || {
-        error "未选择 sysctl 配置文件，已取消 BBR 配置。"
-        return 1
-    }
+    select_sysctl_target || return 1
 
     [[ "$write_bbr" == "0" ]] && result_label="FQ"
     detail "BBR" "DETECT" "目标=$SYSCTL_TARGET；写入 BBR=$write_bbr；原拥塞控制=${previous_cc:-未知}；原队列=${previous_qdisc:-未知}"
@@ -761,8 +792,8 @@ persist_bbr_settings() {
              { [[ "$write_bbr" == "0" ]] || sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; } && \
              [[ "$(sysctl -n net.core.default_qdisc 2>/dev/null)" == "fq" ]] && \
              { [[ "$write_bbr" == "0" ]] || [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; }; then
-            log "$result_label 已生效并通过持久化顺序验证，配置写入 $SYSCTL_TARGET。"
-            [[ -n "$backup_file" ]] && log "原配置备份：$backup_file"
+            action_success "$result_label" "运行状态和持久化顺序验证通过；配置：$SYSCTL_TARGET"
+            [[ -n "$backup_file" ]] && detail "BBR" "BACKUP" "原配置备份=$backup_file"
             return 0
         fi
     fi
@@ -1216,7 +1247,7 @@ create_managed_swap() {
         return 1
     fi
 
-    log "SWAP 创建成功并通过持久化验证。备份：$SWAP_BACKUP_PATH"
+    action_success "SWAP 创建" "$swap_size；运行状态和持久化验证通过；备份：$SWAP_BACKUP_PATH"
 }
 
 remove_managed_swap() {
@@ -1227,6 +1258,7 @@ remove_managed_swap() {
         error "无法备份 SWAP 配置，未执行删除。"
         return 1
     fi
+    log "正在删除脚本管理的 $MANAGED_SWAP_FILE ..."
     if [[ "$was_active" == "1" ]] && ! swapoff "$MANAGED_SWAP_FILE"; then
         error "$MANAGED_SWAP_FILE 卸载失败，未修改持久化配置。"
         return 1
@@ -1272,7 +1304,7 @@ remove_managed_swap() {
         return 1
     fi
 
-    log "$MANAGED_SWAP_FILE 已安全删除；其他 SWAP 保持不变，vm.swappiness 已恢复为 ${SWAP_RESTORED_SWAPPINESS:-系统值}。备份：$SWAP_BACKUP_PATH"
+    action_success "SWAP 删除" "仅删除 $MANAGED_SWAP_FILE；vm.swappiness=${SWAP_RESTORED_SWAPPINESS:-系统值}；备份：$SWAP_BACKUP_PATH"
 }
 
 # ==========================================
@@ -1339,6 +1371,8 @@ submenu_swap() {
                 error "$MANAGED_SWAP_FILE 已存在但未被识别为活动 SWAP，为避免覆盖未知文件已停止操作。"
                 pause_menu; continue
             fi
+            echo "将创建：$MANAGED_SWAP_FILE（$swap_size），并设置 vm.swappiness=10。"
+            confirm_action "确认创建并启用该 SWAP 吗？" || continue
             create_managed_swap "$swap_size"
             pause_menu
         fi
@@ -1383,6 +1417,8 @@ submenu_timezone() {
             *) error "无效选项！"; sleep 1; continue ;;
         esac
 
+        echo "目标时区：$target_tz；同时确保已有时间同步服务正常运行。"
+        confirm_action "确认应用该时间与时区配置吗？" || continue
         log "正在设置时区并检查时间同步服务：$target_tz ..."
         timedatectl set-timezone "$target_tz" 2>/dev/null
 
@@ -1409,33 +1445,34 @@ submenu_timezone() {
         fi
         if [[ -z "$time_sync_service" ]]; then
             require_commands "时间同步服务安装" apt-get dpkg || {
-                error "时区已设置，但无法安装时间同步服务。"
+                action_partial "时区配置" "时区已设置为 $target_tz，但无法安装时间同步服务"
                 pause_menu; continue
             }
             package_manager_ready || {
-                error "时区已设置，但软件包管理器当前不可用，时间同步未配置。"
+                action_partial "时区配置" "时区已设置为 $target_tz，但软件包管理器不可用"
                 pause_menu; continue
             }
             if apt-get install systemd-timesyncd -y >/dev/null 2>&1 && \
                systemctl cat systemd-timesyncd.service >/dev/null 2>&1; then
                 time_sync_service="systemd-timesyncd.service"
             else
-                error "时区已设置，但 systemd-timesyncd 安装失败。"
+                action_partial "时区配置" "时区已设置为 $target_tz，但 systemd-timesyncd 安装失败"
                 pause_menu; continue
             fi
         fi
 
         if ! systemctl enable --now "$time_sync_service" >/dev/null 2>&1 || \
            [[ "$(systemctl is-active "$time_sync_service" 2>/dev/null)" != "active" ]]; then
-            error "时区已设置，但时间同步服务 $time_sync_service 启用失败。"
+            action_partial "时区配置" "时区已设置为 $target_tz，但 $time_sync_service 启用失败"
             pause_menu; continue
         fi
 
         ntp_synchronized=$(timedatectl show -p NTPSynchronized --value 2>/dev/null)
         if [[ "$ntp_synchronized" == "yes" ]]; then
-            log "时区配置成功且系统时间已同步。当前时间：$(date "+%Y-%m-%d %H:%M:%S %Z")"
+            action_success "时区配置" "$target_tz；时间已同步；当前时间：$(date "+%Y-%m-%d %H:%M:%S %Z")"
         else
-            warn "时区已设置，时间同步服务 $time_sync_service 正在运行，但尚未确认完成同步；请稍后用 timedatectl status 复查。"
+            action_partial "时区配置" "$target_tz；$time_sync_service 已运行，尚未确认完成同步"
+            warn "请稍后使用 timedatectl status 复查同步状态。"
         fi
         pause_menu
     done
@@ -2062,6 +2099,11 @@ cleanup_disabled_snaps() {
             failed=1
         fi
     done
+    if [[ "$failed" == "0" ]]; then
+        action_success "Snap 旧版本" "已删除 ${#disabled_snaps[@]} 个"
+    else
+        action_partial "Snap 旧版本" "部分修订版删除失败，请查看上方错误"
+    fi
     return "$failed"
 }
 
@@ -2090,8 +2132,13 @@ submenu_advanced_cleanup() {
                     warn "未安装 Docker。"
                 else
                     docker system df
-                    confirm_action "确认清理 Docker 悬空镜像吗？不会删除容器和数据卷。" &&
-                        docker image prune -f
+                    if confirm_action "确认清理 Docker 悬空镜像吗？不会删除容器和数据卷。"; then
+                        if docker image prune -f; then
+                            action_success "Docker 悬空镜像" "不会删除容器和数据卷"
+                        else
+                            error "Docker 悬空镜像清理失败。"
+                        fi
+                    fi
                 fi
                 pause_menu
                 ;;
@@ -2100,8 +2147,13 @@ submenu_advanced_cleanup() {
                     warn "未安装 Docker。"
                 else
                     docker system df
-                    confirm_action "确认清理 Docker 构建缓存吗？不会删除容器和数据卷。" &&
-                        docker builder prune -f
+                    if confirm_action "确认清理 Docker 构建缓存吗？不会删除容器和数据卷。"; then
+                        if docker builder prune -f; then
+                            action_success "Docker 构建缓存" "不会删除容器和数据卷"
+                        else
+                            error "Docker 构建缓存清理失败。"
+                        fi
+                    fi
                 fi
                 pause_menu
                 ;;
@@ -2165,6 +2217,8 @@ update_system_packages() {
     package_manager_ready || return 1
     export DEBIAN_FRONTEND=noninteractive
 
+    echo "将更新软件源并执行完整软件包升级；不会自动清理缓存、无用包或旧内核。"
+    confirm_action "确认开始系统更新吗？" || return 0
     log "开始执行系统更新..."
     apt-get update || {
         error "更新软件源失败！"
@@ -2177,7 +2231,7 @@ update_system_packages() {
         return 1
     }
 
-    log "系统更新完成，未执行任何清理操作。"
+    action_success "系统更新" "软件包升级完成；未执行清理"
     if [[ -f /var/run/reboot-required ]]; then
         echo -e "${YELLOW}检测到系统需要重启。请先重启，再考虑清理旧内核。${NC}"
         [[ -f /var/run/reboot-required.pkgs ]] && sed 's/^/ - /' /var/run/reboot-required.pkgs
@@ -2216,6 +2270,8 @@ submenu_env() {
 # 模块二：SSH 安全设置
 # ==========================================
 submenu_ssh() {
+    local fail2ban_synced
+
     require_commands "SSH 配置" sshd ss systemctl timeout awk sed grep mktemp || { pause_menu; return; }
     while true; do
         print_header "SSH 端口与登录设置"
@@ -2258,6 +2314,10 @@ submenu_ssh() {
                     pause_menu; continue
                 fi
 
+                echo "SSH 端口将从 $CURRENT_PORT 修改为 $new_port。"
+                warn "请先确认云安全组和防火墙已放行新端口；应用时 SSH 服务会重启。"
+                confirm_action "确认修改 SSH 端口吗？" || continue
+
                 log "正在备份 SSH 配置和服务状态..."
                 if ! begin_ssh_transaction; then
                     error "SSH 备份失败，未修改任何配置。"
@@ -2287,8 +2347,13 @@ submenu_ssh() {
                     pause_menu; continue
                 fi
 
-                sync_fail2ban_ssh_port "$new_port"
-                log "SSH 端口修改成功，当前实际监听：${LISTENING_PORTS:-未知}。备份：$SSH_BACKUP_PATH"
+                fail2ban_synced=1
+                sync_fail2ban_ssh_port "$new_port" || fail2ban_synced=0
+                if [[ "$fail2ban_synced" == "1" ]]; then
+                    action_success "SSH 端口" "$CURRENT_PORT → $new_port；实际监听：${LISTENING_PORTS:-未知}；备份：$SSH_BACKUP_PATH"
+                else
+                    action_partial "SSH 端口" "已切换为 $new_port，但 Fail2ban 端口同步失败"
+                fi
                 warn "请先在新终端使用端口 $new_port 登录成功，再关闭当前会话；同时确认云安全组和防火墙已放行。"
                 pause_menu
                 ;;
@@ -2330,7 +2395,7 @@ submenu_ssh() {
                     pause_menu; continue
                 fi
 
-                log "密钥登录已启用，密码与键盘交互登录已禁用。备份：$SSH_BACKUP_PATH"
+                action_success "SSH 密钥登录" "密码与键盘交互登录已禁用；备份：$SSH_BACKUP_PATH"
                 pause_menu
                 ;;
                 
@@ -2355,20 +2420,21 @@ submenu_sec() {
         case "$choice_sec" in
             1) submenu_ssh ;;
             2) 
-                export DEBIAN_FRONTEND=noninteractive
                 require_commands "Fail2ban 安装" apt-get systemctl || { pause_menu; continue; }
                 package_manager_ready || { pause_menu; continue; }
+                CURRENT_PORT=$(get_ssh_port)
+                if [[ -z "$CURRENT_PORT" ]]; then
+                    error "无法读取 SSH 当前生效端口，未执行 Fail2ban 安装或配置。"
+                    pause_menu; continue
+                fi
+                echo "将安装或更新 Fail2ban，并在现有 jail.local 中为 SSH 端口 $CURRENT_PORT 增量配置防爆破规则。"
+                confirm_action "确认继续配置 Fail2ban 吗？" || continue
+                export DEBIAN_FRONTEND=noninteractive
                 echo -e "${YELLOW}正在更新源并安装 Fail2ban，请稍候...${NC}"
                 apt-get update -y >/dev/null 2>&1 || { error "源更新失败，请检查网络！"; pause_menu; continue; }
                 apt-get install fail2ban -y >/dev/null 2>&1 || { error "Fail2ban 安装失败！"; pause_menu; continue; }
                 
                 log "正在配置防爆破规则..."
-                CURRENT_PORT=$(get_ssh_port)
-                if [[ -z "$CURRENT_PORT" ]]; then
-                    error "无法读取 SSH 当前生效端口，已停止配置 Fail2ban。"
-                    pause_menu; continue
-                fi
-                
                 UBUNTU_MAJOR="${OS_VERSION%%.*}"
                 if [[ "$OS_ID" == "ubuntu" && "$UBUNTU_MAJOR" =~ ^[0-9]+$ && "$UBUNTU_MAJOR" -ge 22 ]] || \
                    [[ "$OS_ID" == "debian" && "$OS_VERSION" =~ ^[0-9]+$ && "$OS_VERSION" -ge 12 && ! -f /var/log/auth.log ]]; then
@@ -2383,7 +2449,7 @@ submenu_sec() {
                     pause_menu; continue
                 fi
                 
-                log "Fail2ban 部署完成，当前已自动监听 $CURRENT_PORT 端口。"
+                action_success "Fail2ban" "配置测试通过；SSH 端口：$CURRENT_PORT"
                 pause_menu
                 ;;
             0) return ;;
@@ -2745,6 +2811,33 @@ dns_verify_fail() {
     return 1
 }
 
+wait_for_default_route() {
+    local family="$1"
+    local interface_name="$2"
+    local expected_gateway="$3"
+    local max_wait="$4"
+    local elapsed=0
+
+    [[ "$max_wait" =~ ^[0-9]+$ ]] || max_wait=0
+    DNS_ROUTE_AFTER=""
+    DNS_ROUTE_WAITED=0
+
+    while true; do
+        DNS_ROUTE_AFTER=$(ip -o "-$family" route show default dev "$interface_name" 2>/dev/null)
+        if [[ -n "$DNS_ROUTE_AFTER" ]] && \
+           { [[ -z "$expected_gateway" ]] || grep -Fq "via $expected_gateway " <<< "$DNS_ROUTE_AFTER"; }; then
+            DNS_ROUTE_WAITED="$elapsed"
+            return 0
+        fi
+        if (( elapsed >= max_wait )); then
+            DNS_ROUTE_WAITED="$elapsed"
+            return 1
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+}
+
 verify_dns_change() {
     local requested_dns="$1"
     local route_after
@@ -2761,35 +2854,43 @@ verify_dns_change() {
     detail "DNS" "VERIFY_START" "请求=$requested_dns；IPv4接口=${DNS_DEFAULT_V4_IFACE_BEFORE:-无}；IPv4网关=${DNS_DEFAULT_V4_GATEWAY_BEFORE:-无}；IPv6接口=${DNS_DEFAULT_V6_IFACE_BEFORE:-无}；IPv6网关=${DNS_DEFAULT_V6_GATEWAY_BEFORE:-无}"
 
     if [[ -n "$DNS_DEFAULT_V4_IFACE_BEFORE" ]]; then
-        route_after=$(ip -o -4 route show default dev "$DNS_DEFAULT_V4_IFACE_BEFORE" 2>/dev/null)
-        if [[ -z "$route_after" ]]; then
-            dns_verify_fail "VERIFY_ROUTE_V4" \
-                "IPv4 默认路由丢失（接口 $DNS_DEFAULT_V4_IFACE_BEFORE）" \
-                "接口=$DNS_DEFAULT_V4_IFACE_BEFORE；修改前网关=${DNS_DEFAULT_V4_GATEWAY_BEFORE:-无}；修改后未发现默认路由"
+        if ! wait_for_default_route 4 "$DNS_DEFAULT_V4_IFACE_BEFORE" \
+            "$DNS_DEFAULT_V4_GATEWAY_BEFORE" "$DNS_ROUTE_V4_WAIT_SECONDS"; then
+            route_after="$DNS_ROUTE_AFTER"
+            if [[ -z "$route_after" ]]; then
+                dns_verify_fail "VERIFY_ROUTE_V4" \
+                    "IPv4 默认路由在等待 ${DNS_ROUTE_WAITED} 秒后仍未恢复（接口 $DNS_DEFAULT_V4_IFACE_BEFORE）" \
+                    "接口=$DNS_DEFAULT_V4_IFACE_BEFORE；修改前网关=${DNS_DEFAULT_V4_GATEWAY_BEFORE:-无}；等待=${DNS_ROUTE_WAITED}秒；修改后未发现默认路由"
+            else
+                dns_verify_fail "VERIFY_ROUTE_V4" \
+                    "IPv4 默认网关在等待 ${DNS_ROUTE_WAITED} 秒后仍与修改前不一致" \
+                    "期望网关=$DNS_DEFAULT_V4_GATEWAY_BEFORE；等待=${DNS_ROUTE_WAITED}秒；实际路由=$route_after"
+            fi
             return 1
         fi
-        if [[ -n "$DNS_DEFAULT_V4_GATEWAY_BEFORE" ]] && \
-           ! grep -Fq "via $DNS_DEFAULT_V4_GATEWAY_BEFORE " <<< "$route_after"; then
-            dns_verify_fail "VERIFY_ROUTE_V4" \
-                "IPv4 默认网关发生变化" \
-                "期望网关=$DNS_DEFAULT_V4_GATEWAY_BEFORE；实际路由=$route_after"
-            return 1
+        route_after="$DNS_ROUTE_AFTER"
+        if (( DNS_ROUTE_WAITED > 0 )); then
+            detail "DNS" "VERIFY_ROUTE_V4" "默认路由等待 ${DNS_ROUTE_WAITED} 秒后恢复；实际路由=$route_after"
         fi
     fi
     if [[ -n "$DNS_DEFAULT_V6_IFACE_BEFORE" ]]; then
-        route_after=$(ip -o -6 route show default dev "$DNS_DEFAULT_V6_IFACE_BEFORE" 2>/dev/null)
-        if [[ -z "$route_after" ]]; then
-            dns_verify_fail "VERIFY_ROUTE_V6" \
-                "IPv6 默认路由丢失（接口 $DNS_DEFAULT_V6_IFACE_BEFORE）" \
-                "接口=$DNS_DEFAULT_V6_IFACE_BEFORE；修改前网关=${DNS_DEFAULT_V6_GATEWAY_BEFORE:-无}；修改后未发现默认路由"
+        if ! wait_for_default_route 6 "$DNS_DEFAULT_V6_IFACE_BEFORE" \
+            "$DNS_DEFAULT_V6_GATEWAY_BEFORE" "$DNS_ROUTE_V6_WAIT_SECONDS"; then
+            route_after="$DNS_ROUTE_AFTER"
+            if [[ -z "$route_after" ]]; then
+                dns_verify_fail "VERIFY_ROUTE_V6" \
+                    "IPv6 默认路由在等待 ${DNS_ROUTE_WAITED} 秒后仍未恢复（接口 $DNS_DEFAULT_V6_IFACE_BEFORE）" \
+                    "接口=$DNS_DEFAULT_V6_IFACE_BEFORE；修改前网关=${DNS_DEFAULT_V6_GATEWAY_BEFORE:-无}；等待=${DNS_ROUTE_WAITED}秒；修改后未发现默认路由"
+            else
+                dns_verify_fail "VERIFY_ROUTE_V6" \
+                    "IPv6 默认网关在等待 ${DNS_ROUTE_WAITED} 秒后仍与修改前不一致" \
+                    "期望网关=$DNS_DEFAULT_V6_GATEWAY_BEFORE；等待=${DNS_ROUTE_WAITED}秒；实际路由=$route_after"
+            fi
             return 1
         fi
-        if [[ -n "$DNS_DEFAULT_V6_GATEWAY_BEFORE" ]] && \
-           ! grep -Fq "via $DNS_DEFAULT_V6_GATEWAY_BEFORE " <<< "$route_after"; then
-            dns_verify_fail "VERIFY_ROUTE_V6" \
-                "IPv6 默认网关发生变化" \
-                "期望网关=$DNS_DEFAULT_V6_GATEWAY_BEFORE；实际路由=$route_after"
-            return 1
+        route_after="$DNS_ROUTE_AFTER"
+        if (( DNS_ROUTE_WAITED > 0 )); then
+            detail "DNS" "VERIFY_ROUTE_V6" "RA/DHCPv6 默认路由等待 ${DNS_ROUTE_WAITED} 秒后恢复；实际路由=$route_after"
         fi
     fi
     if systemctl is-active systemd-resolved >/dev/null 2>&1 && command -v resolvectl >/dev/null 2>&1; then
@@ -2965,11 +3066,14 @@ EOF
         return 1
     fi
 
-    log "DNS 已应用并验证成功；原文件备份保存在 $DNS_BACKUP_PATH。"
+    detail "DNS" "VERIFY_SUCCESS" "DNS 已应用并通过路由、解析器状态和域名解析验证；备份=$DNS_BACKUP_PATH"
     return 0
 }
 
 submenu_dns() {
+    local dns_entry_valid
+    local dns_server
+
     require_commands "DNS 配置" ip systemctl timeout getent awk sed find mktemp || { pause_menu; return; }
     while true; do
         print_header "DNS 配置"
@@ -3018,14 +3122,29 @@ submenu_dns() {
             *) error "无效选项！"; sleep 1; continue ;;
         esac
 
-        log "正在配置 DNS..."
-        if ! apply_dns_servers "$DNS_ENTRY"; then
-            error "DNS 配置未能完全应用，请根据日志检查网络配置。"
+        dns_entry_valid=1
+        for dns_server in $DNS_ENTRY; do
+            if ! validate_dns_address "$dns_server"; then
+                error "无效的 DNS 地址：$dns_server"
+                dns_entry_valid=0
+                break
+            fi
+        done
+        if [[ "$dns_entry_valid" == "0" ]]; then
             pause_menu; continue
         fi
-        
-        sleep 1
-        log "DNS 修改成功！"
+
+        echo "将配置 DNS：$DNS_ENTRY"
+        if command -v netplan >/dev/null 2>&1 && [[ -d /etc/netplan ]]; then
+            warn "netplan 应用时可能短暂重载网络；脚本会等待默认路由恢复，超时则自动回滚。"
+        fi
+        confirm_action "确认应用该 DNS 配置吗？" || continue
+        log "正在配置 DNS..."
+        if ! apply_dns_servers "$DNS_ENTRY"; then
+            pause_menu; continue
+        fi
+
+        action_success "DNS 配置" "运行状态与域名解析验证通过；备份：$DNS_BACKUP_PATH"
         echo "当前检测到的 DNS："
         show_dns_status
         pause_menu
@@ -3064,7 +3183,11 @@ configure_ip_preference() {
          grep -qE '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+' /etc/gai.conf; then
         error "默认地址优先级恢复验证失败。"
     else
-        log "地址优先级已更新。备份：$backup_path"
+        if [[ "$mode" == "ipv4" ]]; then
+            action_success "地址优先级" "IPv4 优先，IPv6 保持启用；备份：$backup_path"
+        else
+            action_success "地址优先级" "已恢复系统默认；备份：$backup_path"
+        fi
         return 0
     fi
 
@@ -3165,6 +3288,7 @@ configure_ipv6_state() {
         touch "$IPV6_SYSCTL_FILE" || return 1
     fi
 
+    log "正在$action_label系统 IPv6 ..."
     if ! write_sysctl_key "$IPV6_SYSCTL_FILE" net.ipv6.conf.all.disable_ipv6 "$target_value" || \
        ! write_sysctl_key "$IPV6_SYSCTL_FILE" net.ipv6.conf.default.disable_ipv6 "$target_value" || \
        ! write_sysctl_key "$IPV6_SYSCTL_FILE" net.ipv6.conf.lo.disable_ipv6 "$target_value" || \
@@ -3189,7 +3313,7 @@ configure_ipv6_state() {
         return 1
     fi
 
-    log "IPv6 已$action_label并通过运行状态和持久化验证。备份：$IPV6_BACKUP_PATH"
+    action_success "IPv6 $action_label" "运行状态和持久化验证通过；备份：$IPV6_BACKUP_PATH"
 }
 
 # ==========================================
@@ -3232,18 +3356,37 @@ submenu_ipv6() {
 
         case "$choice_ipv6" in
             1)
+                if grep -qE '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100([[:space:]]|$)' /etc/gai.conf 2>/dev/null; then
+                    print_result "地址优先级" "跳过" "当前已是 IPv4 优先"
+                    pause_menu; continue
+                fi
+                confirm_action "确认设置 IPv4 优先并保留 IPv6 吗？" || continue
                 log "正在设置 IPv4 优先..."
                 configure_ip_preference ipv4
                 pause_menu ;;
             2)
+                if ! grep -qE '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+' /etc/gai.conf 2>/dev/null; then
+                    print_result "地址优先级" "跳过" "当前已是系统默认"
+                    pause_menu; continue
+                fi
+                confirm_action "确认恢复系统默认地址优先级吗？" || continue
                 log "正在恢复默认路由优先级..."
                 configure_ip_preference default
                 pause_menu ;;
             3)
+                if [[ "$IPV6_STATUS" == "1" ]]; then
+                    print_result "IPv6 禁用" "跳过" "当前已禁用"
+                    pause_menu; continue
+                fi
                 confirm_action "禁用 IPv6 可能影响仅提供 IPv6 的服务，确认继续吗？" || continue
                 configure_ipv6_state 1
                 pause_menu ;;
             4)
+                if [[ "$IPV6_STATUS" == "0" ]]; then
+                    print_result "IPv6 启用" "跳过" "当前已启用"
+                    pause_menu; continue
+                fi
+                confirm_action "确认重新启用系统 IPv6 吗？" || continue
                 configure_ipv6_state 0
                 pause_menu ;;
             0) return ;;
@@ -3279,17 +3422,14 @@ submenu_net() {
                 CURRENT_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null)
 
                 if [[ "$CURRENT_CC" == "bbr" && "$CURRENT_QDISC" == "fq" ]]; then
-                    log "BBR 与 FQ 当前均已开启，不创建或修改任何 sysctl 文件。"
+                    print_result "BBR / FQ" "跳过" "当前均已开启，未修改 sysctl 文件"
                     pause_menu; continue
                 fi
 
                 if [[ "$CURRENT_CC" == "bbr" ]]; then
                     echo -e "${YELLOW}BBR 已开启，但当前默认队列为 ${CURRENT_QDISC:-未知}，不是 fq。${NC}"
-                    read -r -p "是否只补充并启用 FQ？[y/N]: " confirm_fq
-                    if [[ "$confirm_fq" == "y" || "$confirm_fq" == "Y" ]]; then
+                    if confirm_action "确认只补充并启用 FQ 吗？"; then
                         persist_bbr_settings "$CURRENT_CC" "$CURRENT_QDISC" 0
-                    else
-                        log "已保留当前 BBR 与队列配置。"
                     fi
                     pause_menu; continue
                 fi
@@ -3301,6 +3441,8 @@ submenu_net() {
                     pause_menu; continue
                 fi
                 
+                echo "拥塞控制将从 ${CURRENT_CC:-未知} 修改为 bbr，默认队列将从 ${CURRENT_QDISC:-未知} 修改为 fq。"
+                confirm_action "确认配置 BBR 与 FQ 吗？" || continue
                 log "正在根据当前内核的实际能力检测并配置 BBR..."
                 command -v modprobe >/dev/null 2>&1 && modprobe tcp_bbr >/dev/null 2>&1 || true
                 
