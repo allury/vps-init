@@ -19,7 +19,7 @@ DNS_ROUTE_V6_WAIT_SECONDS="${VPS_INIT_DNS_ROUTE_V6_WAIT_SECONDS:-30}"
 IPV6_SYSCTL_FILE="/etc/sysctl.d/99-zz-vps-init-ipv6.conf"
 SWAP_SYSCTL_FILE="/etc/sysctl.d/99-zz-vps-init-swap.conf"
 SSH_MANAGED_FILE="/etc/ssh/sshd_config.d/00-00-vps-init.conf"
-VERSION="1.1.8"
+VERSION="1.2.0"
 MANAGED_SWAP_FILE="/swapfile"
 BACKUP_DIR="/var/backups/vps-init"
 
@@ -1548,14 +1548,198 @@ package_manager_ready() {
 
     audit_output=$(dpkg --audit 2>/dev/null || true)
     if [[ -n "$audit_output" ]]; then
-        error "检测到未完成的软件包配置，请先处理后再执行清理："
+        error "检测到未完成的软件包配置，请先处理后再执行软件包操作："
         echo "$audit_output"
         return 1
     fi
 }
 
+parse_apt_simulated_installs() {
+    awk '$1 == "Inst" {print $2}'
+}
+
 parse_apt_simulated_removals() {
     awk '$1 == "Remv" || $1 == "Purg" {print $2}'
+}
+
+package_is_installed() {
+    local package="$1"
+
+    [[ "$(dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null)" == ii* ]]
+}
+
+is_kernel_meta_package_name() {
+    local package="${1%%:*}"
+
+    case "$package" in
+        *-dbg|*-dbgsym|*-signed-template)
+            return 1
+            ;;
+        linux-image-[0-9]*|linux-image-unsigned-[0-9]*|linux-image-extra-[0-9]*|\
+        linux-headers-[0-9]*|linux-modules-[0-9]*|linux-modules-extra-[0-9]*|\
+        linux-tools-[0-9]*|linux-cloud-tools-[0-9]*)
+            return 1
+            ;;
+        linux-image-*|linux-headers-*|linux-generic|linux-generic-*|\
+        linux-virtual|linux-virtual-*|linux-aws|linux-aws-*|linux-azure|linux-azure-*|\
+        linux-gcp|linux-gcp-*|linux-oracle|linux-oracle-*|linux-kvm|linux-kvm-*|\
+        linux-lowlatency|linux-lowlatency-*|linux-oem-*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+is_kernel_update_package() {
+    local package="${1%%:*}"
+
+    case "$package" in
+        linux-*|initramfs-tools*|dracut*|kmod|busybox-initramfs|busybox-static|zstd)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+collect_installed_kernel_meta_packages() {
+    local package
+
+    KERNEL_META_PACKAGES=()
+    while IFS= read -r package; do
+        [[ -n "$package" ]] || continue
+        if is_kernel_meta_package_name "$package"; then
+            add_unique_path KERNEL_META_PACKAGES "$package"
+        fi
+    done < <(
+        dpkg-query -W -f='${binary:Package}\t${db:Status-Abbrev}\n' 2>/dev/null |
+            awk '$2 ~ /^ii/ {print $1}'
+    )
+}
+
+collect_installed_kernel_releases() {
+    local image
+    local owner
+
+    INSTALLED_KERNEL_RELEASES=()
+    for image in /boot/vmlinuz-*; do
+        [[ -e "$image" ]] || continue
+        owner=$(dpkg-query -S "$image" 2>/dev/null | awk -F': ' 'NR==1 {print $1}')
+        [[ "$owner" == linux-image-* ]] || continue
+        INSTALLED_KERNEL_RELEASES+=("${image#/boot/vmlinuz-}")
+    done
+    if (( ${#INSTALLED_KERNEL_RELEASES[@]} > 0 )); then
+        mapfile -t INSTALLED_KERNEL_RELEASES < <(
+            printf '%s\n' "${INSTALLED_KERNEL_RELEASES[@]}" | sort -Vu
+        )
+    fi
+}
+
+collect_update_plan() {
+    local mode="$1"
+    shift
+    local package
+    local -a simulated_installs=()
+
+    UPDATE_UPGRADE_PACKAGES=()
+    UPDATE_NEW_PACKAGES=()
+    UPDATE_REMOVE_PACKAGES=()
+    UPDATE_SIMULATION_OUTPUT=""
+
+    case "$mode" in
+        regular)
+            UPDATE_SIMULATION_OUTPUT=$(LC_ALL=C apt-get -s -o Debug::NoLocking=1 upgrade 2>&1) || {
+                error "无法生成常规升级预览。"
+                echo "$UPDATE_SIMULATION_OUTPUT"
+                return 1
+            }
+            ;;
+        full)
+            UPDATE_SIMULATION_OUTPUT=$(LC_ALL=C apt-get -s -o Debug::NoLocking=1 full-upgrade 2>&1) || {
+                error "无法生成完整系统升级预览。"
+                echo "$UPDATE_SIMULATION_OUTPUT"
+                return 1
+            }
+            ;;
+        kernel)
+            (( $# > 0 )) || {
+                error "未提供内核元软件包，无法生成内核更新预览。"
+                return 1
+            }
+            UPDATE_SIMULATION_OUTPUT=$(LC_ALL=C apt-get -s -o Debug::NoLocking=1 \
+                install --only-upgrade -- "$@" 2>&1) || {
+                error "无法生成内核更新预览。"
+                echo "$UPDATE_SIMULATION_OUTPUT"
+                return 1
+            }
+            ;;
+        *)
+            error "未知的软件包更新模式：$mode"
+            return 1
+            ;;
+    esac
+
+    mapfile -t simulated_installs < <(
+        printf '%s\n' "$UPDATE_SIMULATION_OUTPUT" | parse_apt_simulated_installs
+    )
+    mapfile -t UPDATE_REMOVE_PACKAGES < <(
+        printf '%s\n' "$UPDATE_SIMULATION_OUTPUT" | parse_apt_simulated_removals
+    )
+    for package in "${simulated_installs[@]}"; do
+        if package_is_installed "$package"; then
+            UPDATE_UPGRADE_PACKAGES+=("$package")
+        else
+            UPDATE_NEW_PACKAGES+=("$package")
+        fi
+    done
+}
+
+print_update_plan() {
+    local package
+
+    echo "升级已有软件包：${#UPDATE_UPGRADE_PACKAGES[@]} 个"
+    for package in "${UPDATE_UPGRADE_PACKAGES[@]}"; do
+        echo " - $package"
+    done
+    echo "新增依赖软件包：${#UPDATE_NEW_PACKAGES[@]} 个"
+    for package in "${UPDATE_NEW_PACKAGES[@]}"; do
+        echo " - $package"
+    done
+    echo "删除软件包：${#UPDATE_REMOVE_PACKAGES[@]} 个"
+    for package in "${UPDATE_REMOVE_PACKAGES[@]}"; do
+        echo -e "${RED} - $package${NC}"
+    done
+}
+
+update_plan_is_empty() {
+    (( ${#UPDATE_UPGRADE_PACKAGES[@]} == 0 && \
+       ${#UPDATE_NEW_PACKAGES[@]} == 0 && \
+       ${#UPDATE_REMOVE_PACKAGES[@]} == 0 ))
+}
+
+validate_regular_update_plan() {
+    if (( ${#UPDATE_NEW_PACKAGES[@]} > 0 || ${#UPDATE_REMOVE_PACKAGES[@]} > 0 )); then
+        error "常规升级预览包含新增或删除软件包，与保守升级边界不符，已停止操作。"
+        return 1
+    fi
+}
+
+validate_kernel_update_plan() {
+    local package
+    local -a unexpected_packages=()
+
+    if (( ${#UPDATE_REMOVE_PACKAGES[@]} > 0 )); then
+        error "内核更新预览包含软件包删除，已停止操作；请改用完整系统升级并核对预览。"
+        return 1
+    fi
+    for package in "${UPDATE_UPGRADE_PACKAGES[@]}" "${UPDATE_NEW_PACKAGES[@]}"; do
+        [[ -n "$package" ]] || continue
+        is_kernel_update_package "$package" || unexpected_packages+=("$package")
+    done
+    if (( ${#unexpected_packages[@]} > 0 )); then
+        error "内核更新预览包含非内核范围的软件包，已停止操作："
+        printf ' - %s\n' "${unexpected_packages[@]}"
+        return 1
+    fi
 }
 
 collect_package_cleanup_candidates() {
@@ -2212,31 +2396,300 @@ submenu_cleanup() {
     done
 }
 
-update_system_packages() {
-    require_commands "系统更新" apt-get dpkg || return 1
+refresh_package_index() {
+    log "正在刷新软件包索引..."
+    if apt-get update -o Acquire::Retries=3; then
+        print_result "软件包索引" "已完成"
+        return 0
+    fi
+    error "软件包索引刷新失败，未执行升级。"
+    return 1
+}
+
+show_reboot_notice() {
+    local current_kernel
+    local latest_kernel=""
+
+    current_kernel=$(uname -r)
+    collect_installed_kernel_releases
+    if (( ${#INSTALLED_KERNEL_RELEASES[@]} > 0 )); then
+        latest_kernel="${INSTALLED_KERNEL_RELEASES[-1]}"
+    fi
+
+    if [[ -f /var/run/reboot-required ]]; then
+        warn "系统提示需要重启；请先重启，再考虑清理旧内核。"
+        [[ -f /var/run/reboot-required.pkgs ]] && sed 's/^/ - /' /var/run/reboot-required.pkgs
+    elif [[ -n "$latest_kernel" && "$current_kernel" != "$latest_kernel" ]]; then
+        warn "当前运行内核 $current_kernel，最新已安装内核 $latest_kernel；请安排重启。"
+    fi
+}
+
+check_available_updates() {
+    require_commands "检查可用更新" apt-get dpkg dpkg-query awk || return 1
+    package_manager_ready || return 1
+
+    echo "此操作只刷新软件包索引并生成完整升级预览，不安装、删除或清理任何软件包。"
+    confirm_action "确认检查可用更新吗？" || return 0
+    refresh_package_index || return 1
+    collect_update_plan full || return 1
+
+    echo "可用更新预览："
+    print_update_plan
+    if update_plan_is_empty; then
+        action_success "更新检查" "系统已是最新状态"
+    else
+        action_success "更新检查" \
+            "升级 ${#UPDATE_UPGRADE_PACKAGES[@]} 个，新增 ${#UPDATE_NEW_PACKAGES[@]} 个，删除 ${#UPDATE_REMOVE_PACKAGES[@]} 个；未安装任何软件包"
+    fi
+    detail "UPDATE" "CHECK" \
+        "升级=${#UPDATE_UPGRADE_PACKAGES[@]}；新增=${#UPDATE_NEW_PACKAGES[@]}；删除=${#UPDATE_REMOVE_PACKAGES[@]}"
+}
+
+run_package_upgrade() {
+    local mode="$1"
+    local label
+    local description
+
+    require_commands "系统更新" apt-get dpkg dpkg-query awk || return 1
     package_manager_ready || return 1
     export DEBIAN_FRONTEND=noninteractive
 
-    echo "将更新软件源并执行完整软件包升级；不会自动清理缓存、无用包或旧内核。"
-    confirm_action "确认开始系统更新吗？" || return 0
-    log "开始执行系统更新..."
-    apt-get update || {
-        error "更新软件源失败！"
-        return 1
-    }
-    apt-get full-upgrade -y \
-        -o Dpkg::Options::="--force-confdef" \
-        -o Dpkg::Options::="--force-confold" || {
-        error "系统升级失败！"
-        return 1
-    }
+    case "$mode" in
+        regular)
+            label="常规软件包升级"
+            description="只升级现有软件包；预览若出现新增依赖或删除软件包将自动停止。"
+            ;;
+        full)
+            label="完整系统升级"
+            description="允许为解决依赖而新增或删除软件包，执行前会列出完整预览。"
+            ;;
+        *)
+            error "未知的系统更新模式：$mode"
+            return 1
+            ;;
+    esac
 
-    action_success "系统更新" "软件包升级完成；未执行清理"
-    if [[ -f /var/run/reboot-required ]]; then
-        echo -e "${YELLOW}检测到系统需要重启。请先重启，再考虑清理旧内核。${NC}"
-        [[ -f /var/run/reboot-required.pkgs ]] && sed 's/^/ - /' /var/run/reboot-required.pkgs
+    echo "$description"
+    echo "本次升级不会清理缓存、无用软件包或旧内核。"
+    confirm_action "确认刷新软件包索引并生成升级预览吗？" || return 0
+    refresh_package_index || return 1
+    collect_update_plan "$mode" || return 1
+    [[ "$mode" != "regular" ]] || validate_regular_update_plan || return 1
+
+    if update_plan_is_empty; then
+        action_success "$label" "没有可安装的更新"
+        return 0
     fi
-    return 0
+
+    echo "$label 预览："
+    print_update_plan
+    detail "UPDATE" "PREVIEW" \
+        "模式=$mode；升级=${#UPDATE_UPGRADE_PACKAGES[@]}；新增=${#UPDATE_NEW_PACKAGES[@]}；删除=${#UPDATE_REMOVE_PACKAGES[@]}"
+    if (( ${#UPDATE_REMOVE_PACKAGES[@]} > 0 )); then
+        warn "升级将删除 ${#UPDATE_REMOVE_PACKAGES[@]} 个软件包，请仔细核对上方列表。"
+    fi
+    confirm_action "确认执行以上升级吗？" || return 0
+
+    log "开始执行${label}..."
+    if [[ "$mode" == "regular" ]]; then
+        apt-get upgrade -y \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold" || {
+            error "$label 执行失败，请检查上方 APT 输出。"
+            return 1
+        }
+    else
+        apt-get full-upgrade -y \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold" || {
+            error "$label 执行失败，请检查上方 APT 输出。"
+            return 1
+        }
+    fi
+
+    if [[ -n "$(dpkg --audit 2>/dev/null || true)" ]]; then
+        action_partial "$label" "APT 已结束，但 dpkg 检测到未完成的软件包配置"
+        return 1
+    fi
+    action_success "$label" "软件包升级完成；未执行清理"
+    show_reboot_notice
+}
+
+show_kernel_update_status() {
+    local current_kernel
+    local latest_kernel="未识别"
+    local current_owner="未识别（可能为厂商或自定义内核）"
+    local boot_path="/boot"
+    local reboot_state="不需要"
+    local package
+    local release
+
+    require_commands "内核状态" uname dpkg-query sort df || return 1
+    current_kernel=$(uname -r)
+    if [[ -e "/boot/vmlinuz-$current_kernel" ]]; then
+        current_owner=$(dpkg-query -S "/boot/vmlinuz-$current_kernel" 2>/dev/null |
+            awk -F': ' 'NR==1 {print $1}')
+        [[ -n "$current_owner" ]] || current_owner="未识别（可能为厂商或自定义内核）"
+    fi
+    collect_installed_kernel_releases
+    if (( ${#INSTALLED_KERNEL_RELEASES[@]} > 0 )); then
+        latest_kernel="${INSTALLED_KERNEL_RELEASES[-1]}"
+    fi
+    collect_installed_kernel_meta_packages
+    [[ -d /boot ]] || boot_path="/"
+    if [[ -f /var/run/reboot-required ]] || \
+       [[ "$latest_kernel" != "未识别" && "$current_kernel" != "$latest_kernel" ]]; then
+        reboot_state="需要"
+    fi
+
+    print_header "内核与重启状态"
+    print_result "当前运行内核" "正常" "$current_kernel"
+    print_result "内核软件包归属" "$([[ "$current_owner" == linux-image-* ]] && echo 正常 || echo 未识别)" "$current_owner"
+    print_result "最新已安装内核" "$([[ "$latest_kernel" == "未识别" ]] && echo 未识别 || echo 正常)" "$latest_kernel"
+    print_result "重启状态" "$([[ "$reboot_state" == "需要" ]] && echo 需要 || echo 正常)" "$reboot_state"
+    echo "已安装的受管内核版本："
+    if (( ${#INSTALLED_KERNEL_RELEASES[@]} == 0 )); then
+        echo " - 未识别"
+    else
+        for release in "${INSTALLED_KERNEL_RELEASES[@]}"; do
+            echo " - $release"
+        done
+    fi
+    echo "已安装的内核元软件包："
+    if (( ${#KERNEL_META_PACKAGES[@]} == 0 )); then
+        echo " - 未识别"
+    else
+        for package in "${KERNEL_META_PACKAGES[@]}"; do
+            echo " - $package"
+        done
+    fi
+    echo "引导分区空间："
+    df -h "$boot_path" | awk 'NR==1 || NR==2'
+    [[ "$reboot_state" != "需要" ]] || warn "请在清理旧内核前先重启并确认新内核运行正常。"
+}
+
+update_kernel_only() {
+    local current_kernel
+    local current_owner
+    local package
+
+    require_commands "内核更新" apt-get dpkg dpkg-query awk sort uname || return 1
+    package_manager_ready || return 1
+    export DEBIAN_FRONTEND=noninteractive
+    current_kernel=$(uname -r)
+
+    if [[ ! -e "/boot/vmlinuz-$current_kernel" ]]; then
+        warn "未找到当前内核的 /boot 引导文件，可能使用厂商或自定义内核；已停止自动更新。"
+        return 1
+    fi
+    current_owner=$(dpkg-query -S "/boot/vmlinuz-$current_kernel" 2>/dev/null |
+        awk -F': ' 'NR==1 {print $1}')
+    if [[ "$current_owner" != linux-image-* ]]; then
+        warn "当前运行内核不属于可识别的 linux-image 软件包；已停止自动更新。"
+        return 1
+    fi
+
+    collect_installed_kernel_meta_packages
+    if (( ${#KERNEL_META_PACKAGES[@]} == 0 )); then
+        warn "未发现已安装的内核元软件包，无法可靠跟踪新版内核；已停止自动更新。"
+        echo "请先由系统或云厂商确认应使用的内核元软件包。"
+        return 1
+    fi
+
+    echo "当前运行内核：$current_kernel"
+    echo "将只请求升级以下已安装的内核元软件包："
+    for package in "${KERNEL_META_PACKAGES[@]}"; do
+        echo " - $package"
+    done
+    echo "不会删除当前内核、备用内核或其他旧内核。"
+    confirm_action "确认刷新软件包索引并生成内核更新预览吗？" || return 0
+    refresh_package_index || return 1
+    collect_update_plan kernel "${KERNEL_META_PACKAGES[@]}" || return 1
+
+    if update_plan_is_empty; then
+        action_success "内核更新" "已安装的内核元软件包均为最新版本"
+        show_reboot_notice
+        return 0
+    fi
+
+    echo "内核更新预览："
+    print_update_plan
+    validate_kernel_update_plan || return 1
+    detail "UPDATE" "KERNEL_PREVIEW" \
+        "元软件包=${KERNEL_META_PACKAGES[*]}；升级=${#UPDATE_UPGRADE_PACKAGES[@]}；新增=${#UPDATE_NEW_PACKAGES[@]}；删除=${#UPDATE_REMOVE_PACKAGES[@]}"
+    confirm_action "确认执行以上内核更新吗？" || return 0
+
+    log "开始通过已安装的内核元软件包执行内核更新..."
+    if ! apt-get install --only-upgrade -y \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" \
+        -- "${KERNEL_META_PACKAGES[@]}"; then
+        error "内核更新失败，请检查上方 APT 输出。"
+        return 1
+    fi
+    if [[ ! -e "/boot/vmlinuz-$current_kernel" ]] || \
+       ! dpkg-query -S "/boot/vmlinuz-$current_kernel" >/dev/null 2>&1; then
+        action_partial "内核更新" "当前运行内核的引导文件或软件包归属验证失败"
+        error "请勿重启，并立即检查 /boot 与已安装内核软件包。"
+        return 1
+    fi
+    if command -v update-grub >/dev/null 2>&1; then
+        if update-grub >/dev/null 2>&1; then
+            print_result "GRUB 配置刷新" "已完成"
+        else
+            action_partial "内核更新" "软件包已升级，但 update-grub 失败"
+            error "请修复引导配置后再重启。"
+            return 1
+        fi
+    else
+        print_result "GRUB 配置刷新" "跳过" "未安装 update-grub"
+    fi
+    action_success "内核更新" "内核软件包升级完成；未删除任何旧内核"
+    show_reboot_notice
+}
+
+submenu_updates() {
+    local choice_update
+    local current_kernel
+    local latest_kernel
+    local reboot_state
+
+    while true; do
+        current_kernel=$(uname -r)
+        latest_kernel="未识别"
+        collect_installed_kernel_releases
+        if (( ${#INSTALLED_KERNEL_RELEASES[@]} > 0 )); then
+            latest_kernel="${INSTALLED_KERNEL_RELEASES[-1]}"
+        fi
+        reboot_state="无需重启"
+        if [[ -f /var/run/reboot-required ]] || \
+           [[ "$latest_kernel" != "未识别" && "$current_kernel" != "$latest_kernel" ]]; then
+            reboot_state="需要重启"
+        fi
+
+        print_header "系统更新"
+        echo -e "  当前内核：${YELLOW}$current_kernel${NC}"
+        echo -e "  最新已安装：${YELLOW}$latest_kernel${NC}  |  状态：${YELLOW}$reboot_state${NC}"
+        echo -e "${DIM}--------------------------------------------------${NC}"
+        print_menu_item 1 "检查可用更新" "只刷新索引并预览"
+        print_menu_item 2 "常规软件包升级" "只升级已有包，不新增、不删除"
+        print_menu_item 3 "完整系统升级" "允许依赖调整，执行前预览"
+        print_menu_item 4 "仅更新内核" "基于已安装的内核元软件包"
+        print_menu_item 5 "查看内核与重启状态" "只读"
+        echo -e "  ${DIM}0. 返回上一级${NC}"
+        echo -e "${CYAN}==================================================${NC}"
+        read -r -p "请输入选项 [0-5]: " choice_update
+
+        case "$choice_update" in
+            1) check_available_updates; pause_menu ;;
+            2) run_package_upgrade regular; pause_menu ;;
+            3) run_package_upgrade full; pause_menu ;;
+            4) update_kernel_only; pause_menu ;;
+            5) show_kernel_update_status; pause_menu ;;
+            0) return ;;
+            *) error "无效输入！"; sleep 1 ;;
+        esac
+    done
 }
 
 # ==========================================
@@ -2247,7 +2700,7 @@ submenu_env() {
 
     while true; do
         print_header "系统维护"
-        print_menu_item 1 "更新系统软件包" "仅更新，不自动清理"
+        print_menu_item 1 "系统更新" "检查 / 常规 / 完整 / 内核 ›"
         print_menu_item 2 "系统清理" "缓存 / 无用包 / 旧内核 / 日志 ›"
         print_menu_item 3 "SWAP 配置" "›"
         print_menu_item 4 "时间与时区配置" "›"
@@ -2256,7 +2709,7 @@ submenu_env() {
         read -r -p "请输入选项 [0-4]: " choice_env
 
         case "$choice_env" in
-            1) update_system_packages; pause_menu ;;
+            1) submenu_updates ;;
             2) submenu_cleanup ;;
             3) submenu_swap ;;
             4) submenu_timezone ;;

@@ -29,6 +29,7 @@ jobs:
           tests/test-logging.sh
           tests/test-action-flow.sh
           tests/test-dns-route-wait.sh
+          tests/test-system-update.sh
 
       - name: Test APT simulation parser
         run: bash tests/test-apt-simulation-parser.sh
@@ -42,6 +43,9 @@ jobs:
       - name: Test DNS route recovery wait
         run: bash tests/test-dns-route-wait.sh
 
+      - name: Test system update boundaries
+        run: bash tests/test-system-update.sh
+
       - name: Install ShellCheck
         run: |
           sudo apt-get update
@@ -54,6 +58,7 @@ jobs:
           tests/test-logging.sh
           tests/test-action-flow.sh
           tests/test-dns-route-wait.sh
+          tests/test-system-update.sh
 
   debian-13:
     name: Debian 13 Bash compatibility
@@ -78,6 +83,7 @@ jobs:
           tests/test-logging.sh
           tests/test-action-flow.sh
           tests/test-dns-route-wait.sh
+          tests/test-system-update.sh
 
       - name: Test APT simulation parser
         run: bash tests/test-apt-simulation-parser.sh
@@ -91,6 +97,9 @@ jobs:
       - name: Test DNS route recovery wait
         run: bash tests/test-dns-route-wait.sh
 
+      - name: Test system update boundaries
+        run: bash tests/test-system-update.sh
+
       - name: Run ShellCheck
         run: >-
           shellcheck --severity=error vps.sh
@@ -98,3 +107,4 @@ jobs:
           tests/test-logging.sh
           tests/test-action-flow.sh
           tests/test-dns-route-wait.sh
+          tests/test-system-update.sh
