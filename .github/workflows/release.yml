@@ -73,6 +73,16 @@ jobs:
             exit 1
           fi
 
+          if [[ "$EVENT_NAME" == "push" && "$REF_TYPE" == "branch" ]]; then
+            tag_commit=$(git rev-parse "refs/tags/${tag}^{commit}")
+            current_commit=$(git rev-parse HEAD)
+            if [[ "$tag_commit" != "$current_commit" ]]; then
+              echo "Release tag $tag does not point to the current commit; waiting for tag update."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
           echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "notes_file=$notes_file" >> "$GITHUB_OUTPUT"

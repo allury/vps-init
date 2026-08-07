@@ -463,6 +463,18 @@ add_unique_path() {
     target_array+=("$value")
 }
 
+array_contains_value() {
+    local array_name="$1"
+    local value="$2"
+    local existing
+    local -n source_array="$array_name"
+
+    for existing in "${source_array[@]}"; do
+        [[ "$existing" == "$value" ]] && return 0
+    done
+    return 1
+}
+
 sysctl_file_has_scope() {
     local file="$1"
     local scope="$2"
@@ -1725,6 +1737,7 @@ collect_compatible_kernel_meta_packages() {
 
 select_kernel_meta_package() {
     local current_kernel="$1"
+    local action_label="${2:-内核更新}"
     local choice
     local index
     local package
@@ -1754,7 +1767,7 @@ select_kernel_meta_package() {
     while true; do
         read -r -p "请选择内核更新路线 [0-${#KERNEL_META_CANDIDATES[@]}]: " choice
         if [[ "$choice" == "0" ]]; then
-            print_result "内核更新" "已取消" "未做任何更改"
+            print_result "$action_label" "已取消" "未做任何更改"
             return 0
         fi
         if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && \
@@ -2229,15 +2242,104 @@ cleanup_unused_packages() {
     return "$failed"
 }
 
+is_kernel_cleanup_meta_package() {
+    local package="${1%%:*}"
+
+    is_kernel_meta_package_name "$package" && return 0
+    case "$package" in
+        linux-headers-[0-9]*|linux-tools-[0-9]*|linux-cloud-tools-[0-9]*|\
+        linux-restricted-modules-[0-9]*|linux-modules-extra-[0-9]*)
+            return 1
+            ;;
+        linux-headers-*|linux-tools-*|linux-cloud-tools-*|linux-restricted-modules-*|\
+        linux-modules-extra-*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+prepare_active_kernel_meta_for_cleanup() {
+    local current_kernel="$1"
+
+    ACTIVE_KERNEL_META=""
+    if ! collect_compatible_kernel_meta_packages "$current_kernel"; then
+        warn "无法识别当前内核类型，已停止旧内核清理。"
+        return 1
+    fi
+    case "${#KERNEL_META_CANDIDATES[@]}" in
+        0)
+            warn "未发现与当前内核匹配的元软件包；将保护当前内核，但不允许连带删除任何内核元包。"
+            ;;
+        1)
+            ACTIVE_KERNEL_META="${KERNEL_META_CANDIDATES[0]}"
+            ;;
+        *)
+            select_kernel_meta_package "$current_kernel" "旧内核清理" || return 1
+            [[ -n "$SELECTED_KERNEL_META" ]] || return 1
+            ACTIVE_KERNEL_META="$SELECTED_KERNEL_META"
+            ;;
+    esac
+}
+
+build_old_kernel_release_plan() {
+    local retention_policy="$1"
+    local current_kernel="$2"
+    shift 2
+    local release
+    local flavor
+    local current_flavor
+    local latest_current_flavor
+    local -a installed_releases=("$@")
+    local -a current_flavor_releases=()
+
+    OLD_KERNEL_RELEASES=()
+    RETAINED_KERNEL_RELEASES=()
+    FALLBACK_KERNEL=""
+    if [[ "$retention_policy" != "keep-fallback" && "$retention_policy" != "current-only" ]]; then
+        error "未知的旧内核保留策略：$retention_policy"
+        return 1
+    fi
+    if ! array_contains_value installed_releases "$current_kernel"; then
+        warn "当前运行内核 $current_kernel 不在可识别的软件包列表中，已停止清理。"
+        return 1
+    fi
+    current_flavor=$(kernel_flavor_from_release "$current_kernel") || {
+        warn "无法识别当前运行内核 $current_kernel 的内核类型，已停止清理。"
+        return 1
+    }
+    for release in "${installed_releases[@]}"; do
+        flavor=$(kernel_flavor_from_release "$release" 2>/dev/null || true)
+        [[ "$flavor" == "$current_flavor" ]] && current_flavor_releases+=("$release")
+    done
+    mapfile -t current_flavor_releases < <(
+        printf '%s\n' "${current_flavor_releases[@]}" | LC_ALL=C sort -Vu
+    )
+    latest_current_flavor="${current_flavor_releases[-1]}"
+    if [[ "$current_kernel" != "$latest_current_flavor" ]]; then
+        warn "当前运行内核 $current_kernel 不是同类型中最新已安装内核 $latest_current_flavor，请先重启。"
+        return 1
+    fi
+
+    RETAINED_KERNEL_RELEASES=("$current_kernel")
+    if [[ "$retention_policy" == "keep-fallback" ]] && \
+       (( ${#current_flavor_releases[@]} > 1 )); then
+        FALLBACK_KERNEL="${current_flavor_releases[-2]}"
+        RETAINED_KERNEL_RELEASES+=("$FALLBACK_KERNEL")
+    fi
+    for release in "${installed_releases[@]}"; do
+        if array_contains_value RETAINED_KERNEL_RELEASES "$release"; then
+            continue
+        fi
+        OLD_KERNEL_RELEASES+=("$release")
+    done
+}
+
 collect_old_kernel_candidates() {
     local retention_policy="${1:-keep-fallback}"
-    local image
-    local owner
     local release
     local package
     local current_kernel
-    local latest_kernel
-    local fallback_kernel
     local retained_release
     local old_release
     local related_stem
@@ -2245,65 +2347,11 @@ collect_old_kernel_candidates() {
     local retained_uses_related
     local -a installed_releases=()
     local -a installed_kernel_packages=()
-    local -a retained_releases=()
 
     OLD_KERNEL_RELEASES=()
     OLD_KERNEL_PACKAGES=()
+    OLD_KERNEL_META_PACKAGES=()
     current_kernel=$(uname -r)
-
-    if [[ "$retention_policy" != "keep-fallback" && "$retention_policy" != "current-only" ]]; then
-        error "未知的旧内核保留策略：$retention_policy"
-        return 1
-    fi
-
-    for image in /boot/vmlinuz-*; do
-        [[ -e "$image" ]] || continue
-        owner=$(dpkg-query -S "$image" 2>/dev/null | awk -F': ' 'NR==1 {print $1}')
-        [[ "$owner" == linux-image-* ]] || continue
-        installed_releases+=("${image#/boot/vmlinuz-}")
-    done
-
-    if (( ${#installed_releases[@]} == 0 )); then
-        warn "未在 /boot 中检测到由软件包管理器安装的内核。"
-        return 1
-    fi
-    mapfile -t installed_releases < <(printf '%s\n' "${installed_releases[@]}" | sort -Vu)
-
-    if ! printf '%s\n' "${installed_releases[@]}" | grep -Fxq "$current_kernel"; then
-        warn "当前运行内核 $current_kernel 不在可识别的软件包列表中，已停止清理。"
-        return 1
-    fi
-    latest_kernel="${installed_releases[-1]}"
-    if [[ "$current_kernel" != "$latest_kernel" ]]; then
-        warn "当前运行内核 $current_kernel 不是最新已安装内核 $latest_kernel，请先重启。"
-        return 1
-    fi
-    if [[ -f /var/run/reboot-required ]]; then
-        warn "系统提示需要重启，为避免删除仍需回退的内核，本次不执行旧内核清理。"
-        return 1
-    fi
-
-    if [[ "$retention_policy" == "keep-fallback" ]]; then
-        if (( ${#installed_releases[@]} <= 2 )); then
-            echo -e "${GREEN}当前仅有运行内核和一个备用内核，无需清理。${NC}"
-            return 0
-        fi
-        fallback_kernel="${installed_releases[-2]}"
-        retained_releases=("$current_kernel" "$latest_kernel" "$fallback_kernel")
-    else
-        if (( ${#installed_releases[@]} <= 1 )); then
-            echo -e "${GREEN}当前没有可删除的旧内核。${NC}"
-            return 0
-        fi
-        retained_releases=("$current_kernel")
-    fi
-
-    for release in "${installed_releases[@]}"; do
-        if printf '%s\n' "${retained_releases[@]}" | grep -Fxq "$release"; then
-            continue
-        fi
-        OLD_KERNEL_RELEASES+=("$release")
-    done
 
     mapfile -t installed_kernel_packages < <(
         dpkg-query -W -f='${binary:Package}\t${db:Status-Abbrev}\n' \
@@ -2311,10 +2359,40 @@ collect_old_kernel_candidates() {
             'linux-image-extra-[0-9]*' \
             'linux-headers-[0-9]*' 'linux-modules-[0-9]*' \
             'linux-modules-extra-[0-9]*' 'linux-tools-[0-9]*' \
-            'linux-cloud-tools-[0-9]*' 2>/dev/null |
+            'linux-cloud-tools-[0-9]*' \
+            'linux-restricted-modules-[0-9]*' 2>/dev/null |
             awk '$2 ~ /^ii/ {sub(/:.*/, "", $1); print $1}'
     )
-
+    for package in "${installed_kernel_packages[@]}"; do
+        case "$package" in
+            linux-image-[0-9]*|linux-image-unsigned-[0-9]*)
+                installed_releases+=("$(kernel_release_from_image_package "$package")")
+                ;;
+        esac
+    done
+    if (( ${#installed_releases[@]} == 0 )); then
+        warn "未检测到由软件包管理器安装的版本化内核映像。"
+        return 1
+    fi
+    mapfile -t installed_releases < <(
+        printf '%s\n' "${installed_releases[@]}" | LC_ALL=C sort -Vu
+    )
+    if [[ ! -s "/boot/vmlinuz-$current_kernel" ]] || \
+       ! dpkg-query -S "/boot/vmlinuz-$current_kernel" >/dev/null 2>&1; then
+        error "当前运行内核的引导文件或软件包归属异常，已停止清理。"
+        return 1
+    fi
+    prepare_active_kernel_meta_for_cleanup "$current_kernel" || return 1
+    if [[ -f /var/run/reboot-required ]]; then
+        warn "系统提示需要重启，为避免删除尚未启动的新内核，本次不执行旧内核清理。"
+        return 1
+    fi
+    build_old_kernel_release_plan \
+        "$retention_policy" "$current_kernel" "${installed_releases[@]}" || return 1
+    if (( ${#OLD_KERNEL_RELEASES[@]} == 0 )); then
+        echo -e "${GREEN}当前没有符合该保留策略的非运行内核。${NC}"
+        return 0
+    fi
     for release in "${OLD_KERNEL_RELEASES[@]}"; do
         for package in "${installed_kernel_packages[@]}"; do
             case "$package" in
@@ -2322,27 +2400,18 @@ collect_old_kernel_candidates() {
                  linux-image-extra-"$release"|\
                  linux-modules-"$release"|linux-modules-extra-"$release"|\
                  linux-headers-"$release"|linux-tools-"$release"|\
-                 linux-cloud-tools-"$release")
+                 linux-cloud-tools-"$release"|linux-restricted-modules-"$release")
                     add_unique_path OLD_KERNEL_PACKAGES "$package"
                     ;;
             esac
         done
     done
-
     for package in "${installed_kernel_packages[@]}"; do
         case "$package" in
-            linux-headers-[0-9]*)
-                related_stem="${package#linux-headers-}"
-                ;;
-            linux-tools-[0-9]*)
-                related_stem="${package#linux-tools-}"
-                ;;
-            linux-cloud-tools-[0-9]*)
-                related_stem="${package#linux-cloud-tools-}"
-                ;;
-            *)
-                continue
-                ;;
+            linux-headers-[0-9]*) related_stem="${package#linux-headers-}" ;;
+            linux-tools-[0-9]*) related_stem="${package#linux-tools-}" ;;
+            linux-cloud-tools-[0-9]*) related_stem="${package#linux-cloud-tools-}" ;;
+            *) continue ;;
         esac
         related_stem="${related_stem%-common}"
         old_uses_related=0
@@ -2354,7 +2423,7 @@ collect_old_kernel_candidates() {
             fi
         done
         [[ "$old_uses_related" == "1" ]] || continue
-        for retained_release in "${retained_releases[@]}"; do
+        for retained_release in "${RETAINED_KERNEL_RELEASES[@]}"; do
             if [[ "$retained_release" == "$related_stem"-* ]]; then
                 retained_uses_related=1
                 break
@@ -2366,8 +2435,13 @@ collect_old_kernel_candidates() {
     done
 
     echo "当前运行内核：$current_kernel"
+    echo "当前内核路线：${ACTIVE_KERNEL_META:-未检测到元软件包}"
     if [[ "$retention_policy" == "keep-fallback" ]]; then
-        echo "保留备用内核：$fallback_kernel"
+        if [[ -n "$FALLBACK_KERNEL" ]]; then
+            echo "保留同类型备用内核：$FALLBACK_KERNEL"
+        else
+            echo "保留同类型备用内核：无"
+        fi
     else
         echo -e "${RED}保留策略：仅保留当前运行内核，不保留备用内核${NC}"
     fi
@@ -2379,32 +2453,99 @@ validate_old_kernel_removal_plan() {
     local simulation_output
     local -a planned_removals=()
 
+    OLD_KERNEL_META_PACKAGES=()
+    OLD_KERNEL_REMOVAL_PLAN=()
     if ! simulation_output=$(LC_ALL=C apt-get -s purge -- "${OLD_KERNEL_PACKAGES[@]}" 2>&1); then
         error "无法生成旧内核删除预览，已停止操作："
         echo "$simulation_output"
         return 1
     fi
     mapfile -t planned_removals < <(
-        printf '%s\n' "$simulation_output" | parse_apt_simulated_removals
+        printf '%s\n' "$simulation_output" |
+            parse_apt_simulated_removals |
+            awk -F: '{print $1}' |
+            sort -u
     )
     if (( ${#planned_removals[@]} == 0 )); then
         error "删除预览中未发现任何候选软件包，已停止操作。"
         return 1
     fi
+    OLD_KERNEL_REMOVAL_PLAN=("${planned_removals[@]}")
     for planned in "${planned_removals[@]}"; do
-        if ! printf '%s\n' "${OLD_KERNEL_PACKAGES[@]}" | grep -Fxq "$planned"; then
-            error "模拟删除还会影响非候选软件包 $planned，已停止操作。"
-            return 1
+        if array_contains_value OLD_KERNEL_PACKAGES "$planned"; then
+            continue
         fi
+        if is_kernel_cleanup_meta_package "$planned"; then
+            if [[ -z "$ACTIVE_KERNEL_META" ]]; then
+                error "模拟删除会移除内核元包 $planned，但当前更新路线未识别，已停止操作。"
+                return 1
+            fi
+            if [[ "$planned" == "$ACTIVE_KERNEL_META" ]]; then
+                error "模拟删除会移除当前内核路线元包 $ACTIVE_KERNEL_META，已停止操作。"
+                return 1
+            fi
+            add_unique_path OLD_KERNEL_META_PACKAGES "$planned"
+            continue
+        fi
+        error "模拟删除还会影响非内核软件包 $planned，已停止操作。"
+        return 1
     done
-
     for package in "${OLD_KERNEL_PACKAGES[@]}"; do
-        if ! printf '%s\n' "${planned_removals[@]}" | grep -Fxq "$package"; then
+        if ! array_contains_value planned_removals "$package"; then
             error "模拟删除未包含候选软件包 $package，已停止操作。"
             return 1
         fi
     done
-    return 0
+}
+
+kernel_removal_plan_signature() {
+    printf '%s\n' "${OLD_KERNEL_REMOVAL_PLAN[@]}"
+}
+
+print_old_kernel_meta_removals() {
+    if (( ${#OLD_KERNEL_META_PACKAGES[@]} == 0 )); then
+        return 0
+    fi
+    echo -e "${RED}以下其他内核路线元包将被一并删除：${NC}"
+    printf ' - %s\n' "${OLD_KERNEL_META_PACKAGES[@]}"
+    warn "删除这些元包后，对应内核路线不会再随系统更新自动安装。"
+}
+
+verify_current_kernel_after_cleanup() {
+    local current_kernel="$1"
+    local package
+    local require_initrd=0
+    local audit_output
+
+    if [[ ! -s "/boot/vmlinuz-$current_kernel" ]] || \
+       ! dpkg-query -S "/boot/vmlinuz-$current_kernel" >/dev/null 2>&1; then
+        error "当前运行内核的引导文件或软件包归属异常。"
+        return 1
+    fi
+    if command -v update-initramfs >/dev/null 2>&1 || command -v dracut >/dev/null 2>&1; then
+        require_initrd=1
+    fi
+    if [[ "$require_initrd" == "1" && ! -s "/boot/initrd.img-$current_kernel" ]]; then
+        error "当前运行内核的 initramfs 不存在或为空。"
+        return 1
+    fi
+    if [[ -n "$ACTIVE_KERNEL_META" ]] && ! package_is_installed "$ACTIVE_KERNEL_META"; then
+        error "当前内核路线元包 $ACTIVE_KERNEL_META 已被意外删除。"
+        return 1
+    fi
+    for package in "${OLD_KERNEL_PACKAGES[@]}" "${OLD_KERNEL_META_PACKAGES[@]}"; do
+        [[ -n "$package" ]] || continue
+        if package_is_installed "$package"; then
+            error "计划删除的软件包 $package 仍处于已安装状态。"
+            return 1
+        fi
+    done
+    audit_output=$(dpkg --audit 2>/dev/null || true)
+    if [[ -n "$audit_output" ]]; then
+        error "旧内核删除后检测到未完成的软件包配置："
+        echo "$audit_output"
+        return 1
+    fi
 }
 
 perform_old_kernel_removal() {
@@ -2415,59 +2556,76 @@ perform_old_kernel_removal() {
 
     current_kernel=$(uname -r)
     before=$(get_root_used_bytes)
-    if apt-get purge -y -- "${OLD_KERNEL_PACKAGES[@]}"; then
-        if [[ ! -e "/boot/vmlinuz-$current_kernel" ]] ||
-           ! dpkg-query -S "/boot/vmlinuz-$current_kernel" >/dev/null 2>&1; then
-            print_result "$result_label" "部分完成" "当前内核引导文件验证失败"
-            error "当前运行内核的引导文件或软件包归属异常，请勿重启并立即检查 /boot。"
-            return 1
-        fi
-        if command -v update-grub >/dev/null 2>&1; then
-            if update-grub >/dev/null 2>&1; then
-                print_result "GRUB 配置刷新" "已完成"
-            else
-                print_result "$result_label" "部分完成" "软件包已删除"
-                print_result "GRUB 配置刷新" "失败"
-                error "旧内核软件包已删除，但 update-grub 失败；请修复引导配置后再重启。"
-                return 1
-            fi
-        else
-            print_result "GRUB 配置刷新" "跳过" "未安装 update-grub"
-        fi
-        print_result "$result_label" "已完成" "${#OLD_KERNEL_RELEASES[@]} 个版本"
-    else
+    if ! apt-get purge -y -- "${OLD_KERNEL_PACKAGES[@]}"; then
         print_result "$result_label" "失败"
         return 1
     fi
+    if ! verify_current_kernel_after_cleanup "$current_kernel"; then
+        print_result "$result_label" "部分完成" "软件包已删除，但当前内核验证失败"
+        error "请勿重启并立即检查 /boot、initramfs 和内核元软件包。"
+        return 1
+    fi
+    if command -v update-grub >/dev/null 2>&1; then
+        if update-grub >/dev/null 2>&1; then
+            print_result "GRUB 配置刷新" "已完成"
+        else
+            print_result "$result_label" "部分完成" "软件包已删除"
+            print_result "GRUB 配置刷新" "失败"
+            error "旧内核软件包已删除，但 update-grub 失败；请修复引导配置后再重启。"
+            return 1
+        fi
+    else
+        print_result "GRUB 配置刷新" "跳过" "未安装 update-grub"
+    fi
+    print_result "$result_label" "已完成" "${#OLD_KERNEL_RELEASES[@]} 个非运行版本"
     after=$(get_root_used_bytes)
     show_released_space "$before" "$after"
 }
 
 cleanup_old_kernels() {
+    local expected_current_kernel
+    local approved_plan
+
     package_manager_ready || return 1
+    expected_current_kernel=$(uname -r)
     collect_old_kernel_candidates keep-fallback || return 1
     if (( ${#OLD_KERNEL_RELEASES[@]} == 0 )); then
         return 0
     fi
     if (( ${#OLD_KERNEL_PACKAGES[@]} == 0 )); then
-        error "已识别旧内核版本，但未找到对应的已安装软件包，已停止操作。"
+        error "已识别非运行内核版本，但未找到对应的已安装软件包，已停止操作。"
         return 1
     fi
-
-    echo "候选旧内核版本："
+    echo "候选非运行内核版本："
     printf ' - %s\n' "${OLD_KERNEL_RELEASES[@]}"
     echo "关联软件包："
     printf ' - %s\n' "${OLD_KERNEL_PACKAGES[@]}"
     validate_old_kernel_removal_plan || return 1
+    print_old_kernel_meta_removals
+    approved_plan=$(kernel_removal_plan_signature)
 
-    echo -e "${YELLOW}旧内核不会被常规清理自动删除，本操作仅在你确认后执行。${NC}"
-    confirm_action "确认删除以上旧内核吗？" || return 0
+    echo -e "${YELLOW}本操作保留当前内核和一个同类型备用内核，其余类型内核不保留。${NC}"
+    confirm_action "确认删除以上非运行内核吗？" || return 0
+    if (( ${#OLD_KERNEL_META_PACKAGES[@]} > 0 )); then
+        confirm_action "确认同时移除以上其他内核路线元包吗？" || return 0
+    fi
+    if [[ -f /var/run/reboot-required ]] || [[ "$(uname -r)" != "$expected_current_kernel" ]]; then
+        error "最终执行前检测到内核状态变化或需要重启，已停止操作。"
+        return 1
+    fi
+    package_manager_ready || return 1
+    validate_old_kernel_removal_plan || return 1
+    if [[ "$(kernel_removal_plan_signature)" != "$approved_plan" ]]; then
+        error "最终 APT 删除计划与确认时不一致，已停止操作；请重新预览并确认。"
+        return 1
+    fi
     perform_old_kernel_removal "旧内核"
 }
 
 cleanup_all_old_kernels() {
     local typed_confirmation
     local expected_current_kernel
+    local approved_plan
 
     package_manager_ready || return 1
     expected_current_kernel=$(uname -r)
@@ -2476,27 +2634,34 @@ cleanup_all_old_kernels() {
         return 0
     fi
     if (( ${#OLD_KERNEL_PACKAGES[@]} == 0 )); then
-        error "已识别旧内核版本，但未找到对应的已安装软件包，已停止操作。"
+        error "已识别非运行内核版本，但未找到对应的已安装软件包，已停止操作。"
         return 1
     fi
 
-    echo -e "${RED}高风险操作：以下全部旧内核将被删除，只保留当前运行内核。${NC}"
-    echo "待删除的旧内核版本："
+    echo -e "${RED}高风险操作：以下全部非运行内核将被删除，只保留当前运行内核。${NC}"
+    echo "待删除的全部非运行内核版本："
     printf ' - %s\n' "${OLD_KERNEL_RELEASES[@]}"
     echo "关联软件包："
     printf ' - %s\n' "${OLD_KERNEL_PACKAGES[@]}"
     validate_old_kernel_removal_plan || return 1
+    print_old_kernel_meta_removals
+    approved_plan=$(kernel_removal_plan_signature)
 
-    echo -e "${RED}删除后系统将没有备用内核；当前内核后续若无法启动，只能通过云厂商控制台或救援模式修复。${NC}"
-    confirm_action "确认继续删除所有旧内核吗？" || return 0
+    echo -e "${RED}删除后系统将没有备用内核；当前内核若无法启动，只能通过云厂商控制台或救援模式修复。${NC}"
+    confirm_action "确认继续删除所有非运行内核吗？" || return 0
     read -r -p "请输入“删除所有旧内核”进行最终确认: " typed_confirmation
     if [[ "$typed_confirmation" != "删除所有旧内核" ]]; then
         warn "确认文字不匹配，已取消操作。"
         return 0
     fi
-
     if [[ -f /var/run/reboot-required ]] || [[ "$(uname -r)" != "$expected_current_kernel" ]]; then
         error "最终执行前检测到内核状态变化或需要重启，已停止操作。"
+        return 1
+    fi
+    package_manager_ready || return 1
+    validate_old_kernel_removal_plan || return 1
+    if [[ "$(kernel_removal_plan_signature)" != "$approved_plan" ]]; then
+        error "最终 APT 删除计划与确认时不一致，已停止操作；请重新预览并确认。"
         return 1
     fi
     perform_old_kernel_removal "全部旧内核"
