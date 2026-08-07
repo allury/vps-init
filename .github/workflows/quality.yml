@@ -30,6 +30,7 @@ jobs:
           tests/test-action-flow.sh
           tests/test-dns-route-wait.sh
           tests/test-system-update.sh
+          tests/test-live-kernel-metadata.sh
 
       - name: Test APT simulation parser
         run: bash tests/test-apt-simulation-parser.sh
@@ -51,6 +52,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes shellcheck
 
+      - name: Test live Ubuntu kernel metadata
+        run: bash tests/test-live-kernel-metadata.sh
+
       - name: Run ShellCheck
         run: >-
           shellcheck --severity=error vps.sh
@@ -59,6 +63,7 @@ jobs:
           tests/test-action-flow.sh
           tests/test-dns-route-wait.sh
           tests/test-system-update.sh
+          tests/test-live-kernel-metadata.sh
 
   debian-13:
     name: Debian 13 Bash compatibility
@@ -84,6 +89,7 @@ jobs:
           tests/test-action-flow.sh
           tests/test-dns-route-wait.sh
           tests/test-system-update.sh
+          tests/test-live-kernel-metadata.sh
 
       - name: Test APT simulation parser
         run: bash tests/test-apt-simulation-parser.sh
@@ -100,6 +106,9 @@ jobs:
       - name: Test system update boundaries
         run: bash tests/test-system-update.sh
 
+      - name: Test live Debian kernel metadata
+        run: bash tests/test-live-kernel-metadata.sh
+
       - name: Run ShellCheck
         run: >-
           shellcheck --severity=error vps.sh
@@ -108,3 +117,4 @@ jobs:
           tests/test-action-flow.sh
           tests/test-dns-route-wait.sh
           tests/test-system-update.sh
+          tests/test-live-kernel-metadata.sh

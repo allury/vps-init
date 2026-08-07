@@ -19,7 +19,7 @@ DNS_ROUTE_V6_WAIT_SECONDS="${VPS_INIT_DNS_ROUTE_V6_WAIT_SECONDS:-30}"
 IPV6_SYSCTL_FILE="/etc/sysctl.d/99-zz-vps-init-ipv6.conf"
 SWAP_SYSCTL_FILE="/etc/sysctl.d/99-zz-vps-init-swap.conf"
 SSH_MANAGED_FILE="/etc/ssh/sshd_config.d/00-00-vps-init.conf"
-VERSION="1.2.0"
+VERSION="1.2.1"
 MANAGED_SWAP_FILE="/swapfile"
 BACKUP_DIR="/var/backups/vps-init"
 
@@ -834,14 +834,15 @@ fi
 # ==========================================
 OS_ID=""
 OS_VERSION=""
+OS_CODENAME=""
 
 check_os() {
     if [ -f /etc/os-release ]; then
         OS_ID=$(grep "^ID=" /etc/os-release | cut -d= -f2 | tr -d '"')
         OS_VERSION=$(grep "^VERSION_ID=" /etc/os-release | cut -d= -f2 | tr -d '"')
+        OS_CODENAME=$(grep "^VERSION_CODENAME=" /etc/os-release | cut -d= -f2 | tr -d '"')
         # 补丁：防范 testing/unstable 镜像 VERSION_ID 为空的致命缺陷
         if [[ -z "$OS_VERSION" ]]; then
-            OS_CODENAME=$(grep "^VERSION_CODENAME=" /etc/os-release | cut -d= -f2 | tr -d '"')
             [[ "$OS_CODENAME" == "trixie" ]] && OS_VERSION="13"
             [[ "$OS_CODENAME" == "bookworm" ]] && OS_VERSION="12"
         fi
@@ -1580,11 +1581,25 @@ is_kernel_meta_package_name() {
         linux-tools-[0-9]*|linux-cloud-tools-[0-9]*)
             return 1
             ;;
-        linux-image-*|linux-headers-*|linux-generic|linux-generic-*|\
-        linux-virtual|linux-virtual-*|linux-aws|linux-aws-*|linux-azure|linux-azure-*|\
-        linux-gcp|linux-gcp-*|linux-oracle|linux-oracle-*|linux-kvm|linux-kvm-*|\
-        linux-lowlatency|linux-lowlatency-*|linux-oem-*)
-            return 0
+    esac
+
+    case "$OS_ID" in
+        debian)
+            [[ "$package" == linux-image-* ]]
+            return
+            ;;
+        ubuntu)
+            case "$package" in
+                linux-image-generic*|linux-image-virtual*|linux-image-aws*|\
+                linux-image-azure*|linux-image-gcp*|linux-image-oracle*|\
+                linux-image-kvm*|linux-image-lowlatency*|linux-image-oem-*|\
+                linux-generic|linux-generic-*|linux-virtual|linux-virtual-*|\
+                linux-aws|linux-aws-*|linux-azure|linux-azure-*|linux-gcp|linux-gcp-*|\
+                linux-oracle|linux-oracle-*|linux-kvm|linux-kvm-*|\
+                linux-lowlatency|linux-lowlatency-*|linux-oem-*)
+                    return 0
+                    ;;
+            esac
             ;;
     esac
     return 1
@@ -1594,11 +1609,304 @@ is_kernel_update_package() {
     local package="${1%%:*}"
 
     case "$package" in
-        linux-*|initramfs-tools*|dracut*|kmod|busybox-initramfs|busybox-static|zstd)
+        linux-*|initramfs-tools*|dracut*|kmod|busybox-initramfs|busybox-static|zstd|\
+        amd64-microcode|intel-microcode)
             return 0
             ;;
     esac
     return 1
+}
+
+kernel_flavor_from_release() {
+    local release="$1"
+
+    case "$OS_ID" in
+        debian)
+            if [[ "$release" =~ \+deb[0-9]+-(.+)$ ]]; then
+                printf '%s\n' "${BASH_REMATCH[1]}"
+            elif [[ "$release" =~ ^[0-9].*-[0-9]+-(.+)$ ]]; then
+                printf '%s\n' "${BASH_REMATCH[1]}"
+            else
+                return 1
+            fi
+            ;;
+        ubuntu)
+            case "$release" in
+                *-generic) printf '%s\n' generic ;;
+                *-lowlatency) printf '%s\n' lowlatency ;;
+                *-aws) printf '%s\n' aws ;;
+                *-azure) printf '%s\n' azure ;;
+                *-gcp) printf '%s\n' gcp ;;
+                *-oracle) printf '%s\n' oracle ;;
+                *-kvm) printf '%s\n' kvm ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+kernel_meta_route_and_flavor() {
+    local package="${1%%:*}"
+    local route
+
+    KERNEL_META_ROUTE=""
+    KERNEL_META_FLAVOR=""
+    KERNEL_META_PRIORITY=0
+    is_kernel_meta_package_name "$package" || return 1
+
+    if [[ "$OS_ID" == "debian" ]]; then
+        route="${package#linux-image-}"
+        KERNEL_META_ROUTE="$route"
+        KERNEL_META_FLAVOR="$route"
+        KERNEL_META_PRIORITY=1
+        return 0
+    fi
+
+    if [[ "$package" == linux-image-* ]]; then
+        route="${package#linux-image-}"
+        KERNEL_META_PRIORITY=1
+    else
+        route="${package#linux-}"
+        KERNEL_META_PRIORITY=2
+    fi
+    KERNEL_META_ROUTE="$route"
+    case "$route" in
+        generic*|virtual*|oem-*) KERNEL_META_FLAVOR="generic" ;;
+        lowlatency*) KERNEL_META_FLAVOR="lowlatency" ;;
+        aws*) KERNEL_META_FLAVOR="aws" ;;
+        azure*) KERNEL_META_FLAVOR="azure" ;;
+        gcp*) KERNEL_META_FLAVOR="gcp" ;;
+        oracle*) KERNEL_META_FLAVOR="oracle" ;;
+        kvm*) KERNEL_META_FLAVOR="kvm" ;;
+        *) return 1 ;;
+    esac
+}
+
+list_installed_kernel_root_meta_packages() {
+    dpkg-query -W -f='${binary:Package}\t${db:Status-Abbrev}\n' 2>/dev/null |
+        awk '$2 ~ /^ii/ {sub(/:.*/, "", $1); print $1}'
+}
+
+collect_compatible_kernel_meta_packages() {
+    local current_kernel="$1"
+    local current_flavor
+    local package
+    local route
+    local priority
+    local -A package_by_route=()
+    local -A priority_by_route=()
+
+    KERNEL_META_CANDIDATES=()
+    current_flavor=$(kernel_flavor_from_release "$current_kernel") || return 1
+    while IFS= read -r package; do
+        [[ -n "$package" ]] || continue
+        kernel_meta_route_and_flavor "$package" || continue
+        [[ "$KERNEL_META_FLAVOR" == "$current_flavor" ]] || continue
+        route="$KERNEL_META_ROUTE"
+        priority="$KERNEL_META_PRIORITY"
+        if [[ -z "${package_by_route[$route]:-}" ]] || \
+           (( priority > ${priority_by_route[$route]:-0} )); then
+            package_by_route["$route"]="$package"
+            priority_by_route["$route"]="$priority"
+        fi
+    done < <(list_installed_kernel_root_meta_packages)
+
+    if (( ${#package_by_route[@]} > 0 )); then
+        mapfile -t KERNEL_META_CANDIDATES < <(
+            for route in "${!package_by_route[@]}"; do
+                printf '%s\n' "${package_by_route[$route]}"
+            done | sort -V
+        )
+    fi
+}
+
+select_kernel_meta_package() {
+    local current_kernel="$1"
+    local choice
+    local index
+    local package
+
+    SELECTED_KERNEL_META=""
+    if ! collect_compatible_kernel_meta_packages "$current_kernel"; then
+        warn "无法识别当前内核 $current_kernel 的发行版内核类型，已停止自动更新。"
+        return 1
+    fi
+    if (( ${#KERNEL_META_CANDIDATES[@]} == 0 )); then
+        warn "未发现与当前内核类型匹配且已安装的内核元软件包，已停止自动更新。"
+        return 1
+    fi
+    if (( ${#KERNEL_META_CANDIDATES[@]} == 1 )); then
+        SELECTED_KERNEL_META="${KERNEL_META_CANDIDATES[0]}"
+        return 0
+    fi
+
+    warn "检测到多条与当前内核类型兼容的更新路线，请明确选择一条："
+    index=1
+    for package in "${KERNEL_META_CANDIDATES[@]}"; do
+        printf ' %d. %s（已安装 %s）\n' "$index" "$package" \
+            "$(dpkg-query -W -f='${Version}' "$package" 2>/dev/null || echo 未知)"
+        ((index++))
+    done
+    echo " 0. 取消"
+    while true; do
+        read -r -p "请选择内核更新路线 [0-${#KERNEL_META_CANDIDATES[@]}]: " choice
+        if [[ "$choice" == "0" ]]; then
+            print_result "内核更新" "已取消" "未做任何更改"
+            return 0
+        fi
+        if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && \
+           (( 10#$choice <= ${#KERNEL_META_CANDIDATES[@]} )); then
+            SELECTED_KERNEL_META="${KERNEL_META_CANDIDATES[choice-1]}"
+            return 0
+        fi
+        error "无效选择，请重新输入。"
+    done
+}
+
+get_installed_package_version() {
+    dpkg-query -W -f='${Version}' "$1" 2>/dev/null
+}
+
+get_candidate_package_version() {
+    LC_ALL=C apt-cache policy "$1" 2>/dev/null |
+        awk '/^[[:space:]]*Candidate:/ {print $2; exit}'
+}
+
+kernel_source_record_allowed() {
+    local record="$1"
+    local codename="$OS_CODENAME"
+
+    [[ "$codename" =~ ^[a-z0-9]+$ ]] || return 1
+    case "$OS_ID" in
+        debian)
+            case " $record " in
+                *" $codename/"*|*" ${codename}-updates/"*|*" ${codename}-security/"*|\
+                *" stable/"*|*" stable-updates/"*|*" stable-security/"*)
+                    return 0
+                    ;;
+            esac
+            ;;
+        ubuntu)
+            case " $record " in
+                *" $codename/"*|*" ${codename}-updates/"*|*" ${codename}-security/"*)
+                    return 0
+                    ;;
+            esac
+            ;;
+    esac
+    return 1
+}
+
+list_package_version_sources() {
+    local package="$1"
+    local version="$2"
+
+    LC_ALL=C apt-cache madison "$package" 2>/dev/null |
+        awk -F'|' -v expected="$version" '
+            {
+                candidate=$2
+                source=$3
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", candidate)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", source)
+                if (candidate == expected) print source
+            }
+        '
+}
+
+validate_official_candidate_source() {
+    local package="$1"
+    local version="$2"
+    local record
+    local allowed_record=""
+    local -a records=()
+
+    mapfile -t records < <(list_package_version_sources "$package" "$version")
+    for record in "${records[@]}"; do
+        if kernel_source_record_allowed "$record"; then
+            allowed_record="$record"
+            break
+        fi
+    done
+    if [[ -z "$allowed_record" ]]; then
+        error "$package 候选版本 $version 未匹配当前系统的稳定版、安全更新或更新仓库，已停止操作。"
+        if (( ${#records[@]} > 0 )); then
+            printf ' - %s\n' "${records[@]}"
+        else
+            echo " - 未找到可核验的软件包来源"
+        fi
+        return 1
+    fi
+    VALIDATED_PACKAGE_SOURCE="$allowed_record"
+}
+
+parse_candidate_kernel_image_dependencies() {
+    awk '
+        {
+            line=$0
+            sub(/^[[:space:]|]*/, "", line)
+            if (line !~ /^(Pre)?Depends:[[:space:]]+/) next
+            sub(/^(Pre)?Depends:[[:space:]]+/, "", line)
+            gsub(/[<>]/, "", line)
+            sub(/:.*/, "", line)
+            if (line ~ /^linux-image-(unsigned-)?[0-9]/) print line
+        }
+    '
+}
+
+collect_candidate_kernel_images() {
+    local meta_package="$1"
+
+    CANDIDATE_KERNEL_IMAGES=()
+    mapfile -t CANDIDATE_KERNEL_IMAGES < <(
+        LC_ALL=C apt-cache depends --recurse --important "$meta_package" 2>/dev/null |
+            parse_candidate_kernel_image_dependencies |
+            sort -u
+    )
+    if (( ${#CANDIDATE_KERNEL_IMAGES[@]} == 0 )); then
+        error "无法从 $meta_package 的候选依赖中解析具体内核映像软件包，已停止操作。"
+        return 1
+    fi
+}
+
+kernel_release_from_image_package() {
+    local package="${1%%:*}"
+
+    package="${package#linux-image-unsigned-}"
+    package="${package#linux-image-}"
+    printf '%s\n' "$package"
+}
+
+validate_candidate_kernel_images() {
+    local current_flavor="$1"
+    local package
+    local release
+    local flavor
+    local version
+
+    for package in "${CANDIDATE_KERNEL_IMAGES[@]}"; do
+        release=$(kernel_release_from_image_package "$package")
+        flavor=$(kernel_flavor_from_release "$release") || {
+            error "无法识别候选内核 $package 的内核类型，已停止操作。"
+            return 1
+        }
+        if [[ "$flavor" != "$current_flavor" ]]; then
+            error "候选内核 $package 属于 $flavor 路线，与当前 $current_flavor 路线不一致，已停止操作。"
+            return 1
+        fi
+        version=$(get_candidate_package_version "$package")
+        if [[ -z "$version" || "$version" == "(none)" ]]; then
+            error "无法获取候选内核软件包 $package 的候选版本，已停止操作。"
+            return 1
+        fi
+        validate_official_candidate_source "$package" "$version" || return 1
+    done
+}
+
+package_is_held() {
+    apt-mark showhold 2>/dev/null | grep -Fxq -- "$1"
 }
 
 collect_installed_kernel_meta_packages() {
@@ -1666,7 +1974,7 @@ collect_update_plan() {
                 return 1
             }
             UPDATE_SIMULATION_OUTPUT=$(LC_ALL=C apt-get -s -o Debug::NoLocking=1 \
-                install --only-upgrade -- "$@" 2>&1) || {
+                install --only-upgrade --no-install-recommends -- "$@" 2>&1) || {
                 error "无法生成内核更新预览。"
                 echo "$UPDATE_SIMULATION_OUTPUT"
                 return 1
@@ -2568,12 +2876,89 @@ show_kernel_update_status() {
     [[ "$reboot_state" != "需要" ]] || warn "请在清理旧内核前先重启并确认新内核运行正常。"
 }
 
+validate_planned_kernel_images() {
+    local package
+    local candidate
+    local matched
+
+    for package in "${UPDATE_UPGRADE_PACKAGES[@]}" "${UPDATE_NEW_PACKAGES[@]}"; do
+        package="${package%%:*}"
+        [[ "$package" == linux-image-[0-9]* || "$package" == linux-image-unsigned-[0-9]* ]] || continue
+        matched=0
+        for candidate in "${CANDIDATE_KERNEL_IMAGES[@]}"; do
+            if [[ "$package" == "${candidate%%:*}" ]]; then
+                matched=1
+                break
+            fi
+        done
+        if [[ "$matched" == "0" ]]; then
+            error "升级预览包含未由所选元包声明的内核映像 $package，已停止操作。"
+            return 1
+        fi
+    done
+}
+
+candidate_kernel_images_ready() {
+    local package
+    local release
+    local require_initrd=0
+
+    if command -v update-initramfs >/dev/null 2>&1 || command -v dracut >/dev/null 2>&1; then
+        require_initrd=1
+    fi
+    for package in "${CANDIDATE_KERNEL_IMAGES[@]}"; do
+        release=$(kernel_release_from_image_package "$package")
+        if ! package_is_installed "$package"; then
+            error "目标内核软件包 $package 未处于已安装状态。"
+            return 1
+        fi
+        if [[ ! -s "/boot/vmlinuz-$release" ]]; then
+            error "目标内核引导文件 /boot/vmlinuz-$release 不存在或为空。"
+            return 1
+        fi
+        if [[ "$require_initrd" == "1" && ! -s "/boot/initrd.img-$release" ]]; then
+            error "目标内核 initramfs /boot/initrd.img-$release 不存在或为空。"
+            return 1
+        fi
+    done
+}
+
+verify_kernel_update_result() {
+    local selected_meta="$1"
+    local expected_version="$2"
+    local current_kernel="$3"
+    local installed_version
+    local audit_output
+
+    installed_version=$(get_installed_package_version "$selected_meta")
+    if [[ "$installed_version" != "$expected_version" ]]; then
+        error "$selected_meta 实际版本为 ${installed_version:-未知}，与预期 $expected_version 不一致。"
+        return 1
+    fi
+    audit_output=$(dpkg --audit 2>/dev/null || true)
+    if [[ -n "$audit_output" ]]; then
+        error "内核更新后检测到未完成的软件包配置："
+        echo "$audit_output"
+        return 1
+    fi
+    if [[ ! -s "/boot/vmlinuz-$current_kernel" ]] || \
+       ! dpkg-query -S "/boot/vmlinuz-$current_kernel" >/dev/null 2>&1; then
+        error "当前运行内核的引导文件或软件包归属验证失败。"
+        return 1
+    fi
+    candidate_kernel_images_ready
+}
+
 update_kernel_only() {
     local current_kernel
     local current_owner
+    local current_flavor
+    local installed_meta_version
+    local candidate_meta_version
+    local meta_source
     local package
 
-    require_commands "内核更新" apt-get dpkg dpkg-query awk sort uname || return 1
+    require_commands "内核更新" apt-get apt-cache apt-mark dpkg dpkg-query awk sort uname grep || return 1
     package_manager_ready || return 1
     export DEBIAN_FRONTEND=noninteractive
     current_kernel=$(uname -r)
@@ -2584,67 +2969,101 @@ update_kernel_only() {
     fi
     current_owner=$(dpkg-query -S "/boot/vmlinuz-$current_kernel" 2>/dev/null |
         awk -F': ' 'NR==1 {print $1}')
-    if [[ "$current_owner" != linux-image-* ]]; then
+    current_owner="${current_owner%%:*}"
+    if [[ "$current_owner" != linux-image-* && "$current_owner" != linux-image-unsigned-* ]]; then
         warn "当前运行内核不属于可识别的 linux-image 软件包；已停止自动更新。"
         return 1
     fi
-
-    collect_installed_kernel_meta_packages
-    if (( ${#KERNEL_META_PACKAGES[@]} == 0 )); then
-        warn "未发现已安装的内核元软件包，无法可靠跟踪新版内核；已停止自动更新。"
-        echo "请先由系统或云厂商确认应使用的内核元软件包。"
+    current_flavor=$(kernel_flavor_from_release "$current_kernel") || {
+        warn "无法识别当前内核 $current_kernel 的内核类型；已停止自动更新。"
+        return 1
+    }
+    select_kernel_meta_package "$current_kernel" || return 1
+    [[ -n "$SELECTED_KERNEL_META" ]] || return 0
+    installed_meta_version=$(get_installed_package_version "$SELECTED_KERNEL_META")
+    if [[ -z "$installed_meta_version" ]]; then
+        error "所选内核元软件包 $SELECTED_KERNEL_META 未处于已安装状态。"
+        return 1
+    fi
+    if package_is_held "$SELECTED_KERNEL_META"; then
+        warn "$SELECTED_KERNEL_META 已被 apt-mark hold，未自动解除锁定或执行更新。"
         return 1
     fi
 
     echo "当前运行内核：$current_kernel"
-    echo "将只请求升级以下已安装的内核元软件包："
-    for package in "${KERNEL_META_PACKAGES[@]}"; do
-        echo " - $package"
-    done
-    echo "不会删除当前内核、备用内核或其他旧内核。"
-    confirm_action "确认刷新软件包索引并生成内核更新预览吗？" || return 0
+    echo "当前内核软件包：$current_owner"
+    echo "选定更新路线：$SELECTED_KERNEL_META（已安装 $installed_meta_version）"
+    echo "不会切换内核类型，也不会删除当前内核、备用内核或其他旧内核。"
+    confirm_action "确认刷新软件包索引并核验该内核路线吗？" || return 0
     refresh_package_index || return 1
-    collect_update_plan kernel "${KERNEL_META_PACKAGES[@]}" || return 1
+
+    candidate_meta_version=$(get_candidate_package_version "$SELECTED_KERNEL_META")
+    if [[ -z "$candidate_meta_version" || "$candidate_meta_version" == "(none)" ]]; then
+        error "无法获取 $SELECTED_KERNEL_META 的候选版本，已停止操作。"
+        return 1
+    fi
+    validate_official_candidate_source "$SELECTED_KERNEL_META" "$candidate_meta_version" || return 1
+    meta_source="$VALIDATED_PACKAGE_SOURCE"
+    collect_candidate_kernel_images "$SELECTED_KERNEL_META" || return 1
+    validate_candidate_kernel_images "$current_flavor" || return 1
+
+    echo "内核更新目标："
+    echo " - 元软件包：$SELECTED_KERNEL_META"
+    echo " - 版本：$installed_meta_version → $candidate_meta_version"
+    echo " - 来源：$meta_source"
+    echo " - 具体内核映像："
+    printf '   - %s\n' "${CANDIDATE_KERNEL_IMAGES[@]}"
+
+    collect_update_plan kernel "$SELECTED_KERNEL_META=$candidate_meta_version" || return 1
+    validate_kernel_update_plan || return 1
+    validate_planned_kernel_images || return 1
 
     if update_plan_is_empty; then
-        action_success "内核更新" "已安装的内核元软件包均为最新版本"
+        if ! candidate_kernel_images_ready; then
+            error "APT 未生成修复计划，但目标内核文件不完整，请先检查软件包状态。"
+            return 1
+        fi
+        action_success "内核更新" "$SELECTED_KERNEL_META 及目标内核均已是最新状态"
         show_reboot_notice
         return 0
     fi
 
     echo "内核更新预览："
     print_update_plan
-    validate_kernel_update_plan || return 1
     detail "UPDATE" "KERNEL_PREVIEW" \
-        "元软件包=${KERNEL_META_PACKAGES[*]}；升级=${#UPDATE_UPGRADE_PACKAGES[@]}；新增=${#UPDATE_NEW_PACKAGES[@]}；删除=${#UPDATE_REMOVE_PACKAGES[@]}"
-    confirm_action "确认执行以上内核更新吗？" || return 0
+        "路线=$SELECTED_KERNEL_META；版本=$installed_meta_version->$candidate_meta_version；目标=${CANDIDATE_KERNEL_IMAGES[*]}；升级=${#UPDATE_UPGRADE_PACKAGES[@]}；新增=${#UPDATE_NEW_PACKAGES[@]}；删除=${#UPDATE_REMOVE_PACKAGES[@]}"
+    confirm_action "确认执行以上单一路线内核更新吗？" || return 0
 
-    log "开始通过已安装的内核元软件包执行内核更新..."
-    if ! apt-get install --only-upgrade -y \
+    log "开始通过 $SELECTED_KERNEL_META 更新 $current_flavor 内核路线..."
+    if ! apt-get install --only-upgrade --no-install-recommends -y \
         -o Dpkg::Options::="--force-confdef" \
         -o Dpkg::Options::="--force-confold" \
-        -- "${KERNEL_META_PACKAGES[@]}"; then
+        -- "$SELECTED_KERNEL_META=$candidate_meta_version"; then
         error "内核更新失败，请检查上方 APT 输出。"
         return 1
     fi
-    if [[ ! -e "/boot/vmlinuz-$current_kernel" ]] || \
-       ! dpkg-query -S "/boot/vmlinuz-$current_kernel" >/dev/null 2>&1; then
-        action_partial "内核更新" "当前运行内核的引导文件或软件包归属验证失败"
-        error "请勿重启，并立即检查 /boot 与已安装内核软件包。"
+    if ! verify_kernel_update_result \
+        "$SELECTED_KERNEL_META" "$candidate_meta_version" "$current_kernel"; then
+        action_partial "内核更新" "软件包操作已结束，但内核或引导文件验证失败"
+        error "请勿重启，并立即检查 /boot、initramfs 与已安装内核软件包。"
         return 1
     fi
     if command -v update-grub >/dev/null 2>&1; then
         if update-grub >/dev/null 2>&1; then
             print_result "GRUB 配置刷新" "已完成"
         else
-            action_partial "内核更新" "软件包已升级，但 update-grub 失败"
+            action_partial "内核更新" "内核验证通过，但 update-grub 失败"
             error "请修复引导配置后再重启。"
             return 1
         fi
     else
         print_result "GRUB 配置刷新" "跳过" "未安装 update-grub"
     fi
-    action_success "内核更新" "内核软件包升级完成；未删除任何旧内核"
+    action_success "内核更新" "$SELECTED_KERNEL_META 已更新至 $candidate_meta_version；未删除任何旧内核"
+    echo "目标内核映像："
+    for package in "${CANDIDATE_KERNEL_IMAGES[@]}"; do
+        echo " - $(kernel_release_from_image_package "$package")"
+    done
     show_reboot_notice
 }
 
