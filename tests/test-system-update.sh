@@ -71,6 +71,23 @@ OS_ID=ubuntu
 [[ "$(kernel_flavor_from_release 6.8.0-1030-aws)" == "aws" ]] || \
     fail_test "Ubuntu AWS flavor was not detected"
 
+OS_ID=debian
+[[ "$(latest_installed_kernel_for_current_flavor 6.12.96+deb13-amd64 \
+    6.12.95+deb13-amd64 6.12.96+deb13-amd64 6.12.99+deb13-cloud-amd64)" == \
+    "6.12.96+deb13-amd64" ]] || fail_test "another Debian kernel flavor affected the latest version"
+[[ "$(latest_installed_kernel_for_current_flavor 6.12.96+deb13-amd64 \
+    6.12.96+deb13-amd64 6.12.97+deb13-amd64)" == "6.12.97+deb13-amd64" ]] || \
+    fail_test "the latest Debian running-flavor kernel was not selected"
+
+OS_ID=ubuntu
+[[ "$(latest_installed_kernel_for_current_flavor 6.8.0-136-generic \
+    6.8.0-136-generic 6.8.0-200-aws)" == "6.8.0-136-generic" ]] || \
+    fail_test "another Ubuntu kernel flavor affected the latest version"
+if latest_installed_kernel_for_current_flavor custom-kernel \
+    6.8.0-136-generic 6.8.0-200-aws >/dev/null 2>&1; then
+    fail_test "an unrecognized running kernel should not produce a latest release"
+fi
+
 INSTALLED_META_PACKAGE_LIST=""
 list_installed_kernel_root_meta_packages() {
     printf '%s\n' "$INSTALLED_META_PACKAGE_LIST"

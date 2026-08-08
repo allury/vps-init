@@ -19,7 +19,7 @@ DNS_ROUTE_V6_WAIT_SECONDS="${VPS_INIT_DNS_ROUTE_V6_WAIT_SECONDS:-30}"
 IPV6_SYSCTL_FILE="/etc/sysctl.d/99-zz-vps-init-ipv6.conf"
 SWAP_SYSCTL_FILE="/etc/sysctl.d/99-zz-vps-init-swap.conf"
 SSH_MANAGED_FILE="/etc/ssh/sshd_config.d/00-00-vps-init.conf"
-VERSION="1.2.1"
+VERSION="1.2.2"
 MANAGED_SWAP_FILE="/swapfile"
 BACKUP_DIR="/var/backups/vps-init"
 
@@ -217,6 +217,40 @@ action_partial() {
 
 get_ssh_port() {
     sshd -T 2>/dev/null | awk '/^port /{print $2; exit}'
+}
+
+get_configured_ssh_ports() {
+    sshd -T 2>/dev/null | awk '
+        /^port [0-9]+$/ {
+            port=$2
+            if (!seen[port]++) ports[++count]=port
+        }
+        END {
+            for (i=1; i<=count; i++) printf "%s%s", ports[i], (i<count ? "," : "")
+        }'
+}
+
+is_valid_ssh_port() {
+    local port="$1"
+
+    [[ "$port" == "22" ]] && return 0
+    [[ "$port" =~ ^[1-9][0-9]{3,4}$ ]] || return 1
+    (( 10#$port >= 1024 && 10#$port <= 65535 ))
+}
+
+ssh_uses_only_port() {
+    local expected_port="$1"
+    local configured_ports="${2:-$(get_configured_ssh_ports)}"
+    local listening_ports="${3:-$(get_listening_ssh_ports)}"
+
+    [[ "$configured_ports" == "$expected_port" && "$listening_ports" == "$expected_port" ]]
+}
+
+ssh_port_accepts_loopback() {
+    local port="$1"
+
+    timeout 3 bash -c "</dev/tcp/127.0.0.1/$port" 2>/dev/null ||
+        timeout 3 bash -c "</dev/tcp/::1/$port" 2>/dev/null
 }
 
 get_listening_ssh_ports() {
@@ -475,6 +509,18 @@ array_contains_value() {
     return 1
 }
 
+array_contains_package_name() {
+    local array_name="$1"
+    local value="${2%%:*}"
+    local existing
+    local -n source_array="$array_name"
+
+    for existing in "${source_array[@]}"; do
+        [[ "${existing%%:*}" == "$value" ]] && return 0
+    done
+    return 1
+}
+
 sysctl_file_has_scope() {
     local file="$1"
     local scope="$2"
@@ -685,6 +731,15 @@ get_effective_sysctl_value() {
         [[ -n "$file_value" ]] && value="$file_value"
     done
     printf '%s' "$value"
+}
+
+bbr_persistence_is_complete() {
+    local effective_cc
+    local effective_qdisc
+
+    effective_cc=$(get_effective_sysctl_value net.ipv4.tcp_congestion_control)
+    effective_qdisc=$(get_effective_sysctl_value net.core.default_qdisc)
+    [[ "$effective_cc" == "bbr" && "$effective_qdisc" == "fq" ]]
 }
 
 get_effective_sysctl_source() {
@@ -978,7 +1033,7 @@ rollback_ssh_with_message() {
     local configured_port
     local listening_ports
 
-    configured_port=$(get_ssh_port)
+    configured_port=$(get_configured_ssh_ports)
     listening_ports=$(get_listening_ssh_ports)
     detail "SSH" "ROLLBACK" "触发原因=$message；配置端口=${configured_port:-未知}；监听端口=${listening_ports:-未检测到}；ssh.service=$(systemctl is-active ssh.service 2>/dev/null || printf 未知)；ssh.socket=$(systemctl is-active ssh.socket 2>/dev/null || printf 未知)；备份=$SSH_BACKUP_PATH"
 
@@ -1172,6 +1227,83 @@ remove_managed_swappiness() {
     SWAP_RESTORED_SWAPPINESS="$restore_value"
 }
 
+swap_memory_headroom_bytes() {
+    local total_bytes="$1"
+    local headroom=$((64 * 1024 * 1024))
+    local proportional
+
+    [[ "$total_bytes" =~ ^[0-9]+$ ]] || total_bytes=0
+    proportional=$((total_bytes / 10))
+    (( proportional > headroom )) && headroom="$proportional"
+    printf '%s' "$headroom"
+}
+
+swap_creation_capacity_is_safe() {
+    local available_bytes="$1"
+    local expected_bytes="$2"
+    local headroom=$((256 * 1024 * 1024))
+
+    [[ "$available_bytes" =~ ^[0-9]+$ ]] || return 1
+    [[ "$expected_bytes" =~ ^[0-9]+$ ]] || return 1
+    (( available_bytes >= expected_bytes + headroom ))
+}
+
+swap_removal_capacity_is_safe() {
+    local available_bytes="$1"
+    local used_swap_bytes="$2"
+    local total_bytes="$3"
+    local headroom
+
+    [[ "$available_bytes" =~ ^[0-9]+$ ]] || return 1
+    [[ "$used_swap_bytes" =~ ^[0-9]+$ ]] || return 1
+    [[ "$total_bytes" =~ ^[0-9]+$ ]] || return 1
+    (( used_swap_bytes == 0 )) && return 0
+    headroom=$(swap_memory_headroom_bytes "$total_bytes")
+    (( available_bytes >= used_swap_bytes + headroom ))
+}
+
+preflight_swap_creation() {
+    local expected_bytes="$1"
+    local available_bytes
+    local headroom=$((256 * 1024 * 1024))
+    local required_bytes=$((expected_bytes + headroom))
+
+    available_bytes=$(df -B1 --output=avail "$(dirname "$MANAGED_SWAP_FILE")" 2>/dev/null |
+        awk 'NR==2 {gsub(/[[:space:]]/, ""); print $1}')
+    if [[ ! "$available_bytes" =~ ^[0-9]+$ ]]; then
+        error "无法读取 SWAP 所在文件系统的可用空间，已停止创建。"
+        return 1
+    fi
+    if ! swap_creation_capacity_is_safe "$available_bytes" "$expected_bytes"; then
+        error "磁盘可用空间不足：需要至少 $(format_bytes "$required_bytes")（包含 256MiB 安全余量），当前仅 $(format_bytes "$available_bytes")。"
+        return 1
+    fi
+    echo "磁盘预检：可用 $(format_bytes "$available_bytes")；创建后至少保留 256MiB 安全余量。"
+}
+
+preflight_swap_removal() {
+    local available_bytes
+    local total_bytes
+    local used_swap_bytes
+    local headroom
+
+    available_bytes=$(awk '/^MemAvailable:/ {printf "%.0f\n", $2 * 1024; exit}' /proc/meminfo)
+    total_bytes=$(awk '/^MemTotal:/ {printf "%.0f\n", $2 * 1024; exit}' /proc/meminfo)
+    used_swap_bytes=$(swapon --show=NAME,USED --bytes --noheadings --raw 2>/dev/null |
+        awk -v path="$MANAGED_SWAP_FILE" '$1==path {sum+=$2} END {printf "%.0f\n", sum+0}')
+    if [[ ! "$available_bytes" =~ ^[0-9]+$ || ! "$total_bytes" =~ ^[0-9]+$ || \
+          ! "$used_swap_bytes" =~ ^[0-9]+$ ]]; then
+        error "无法读取内存或 SWAP 使用量，已停止删除。"
+        return 1
+    fi
+    headroom=$(swap_memory_headroom_bytes "$total_bytes")
+    echo "内存预检：可用 $(format_bytes "$available_bytes")；该 SWAP 已用 $(format_bytes "$used_swap_bytes")；安全余量 $(format_bytes "$headroom")。"
+    if ! swap_removal_capacity_is_safe "$available_bytes" "$used_swap_bytes" "$total_bytes"; then
+        error "可用内存不足以安全卸载 $MANAGED_SWAP_FILE，已停止删除；请先释放内存或降低 SWAP 使用量。"
+        return 1
+    fi
+}
+
 create_managed_swap() {
     local swap_size="$1"
     local expected_bytes
@@ -1191,6 +1323,8 @@ create_managed_swap() {
         fi
     fi
     count_val=$((expected_bytes / 1048576))
+
+    preflight_swap_creation "$expected_bytes" || return 1
 
     if ! begin_swap_transaction; then
         error "无法完成 SWAP 配置备份，未创建文件。"
@@ -1267,6 +1401,7 @@ remove_managed_swap() {
     local was_active="$1"
     local fstab_temp
 
+    preflight_swap_removal || return 1
     if ! begin_swap_transaction; then
         error "无法备份 SWAP 配置，未执行删除。"
         return 1
@@ -1658,6 +1793,44 @@ kernel_flavor_from_release() {
             return 1
             ;;
     esac
+}
+
+latest_installed_kernel_for_current_flavor() {
+    local current_kernel="$1"
+    shift
+    local current_flavor
+    local release
+    local release_flavor
+    local -a matching_releases=()
+
+    current_flavor=$(kernel_flavor_from_release "$current_kernel") || return 1
+    for release in "$@"; do
+        release_flavor=$(kernel_flavor_from_release "$release" 2>/dev/null || true)
+        [[ "$release_flavor" == "$current_flavor" ]] && matching_releases+=("$release")
+    done
+    (( ${#matching_releases[@]} > 0 )) || return 1
+    printf '%s\n' "${matching_releases[@]}" | LC_ALL=C sort -Vu | tail -n 1
+}
+
+is_versioned_kernel_package() {
+    local package="${1%%:*}"
+
+    case "$package" in
+        linux-image-[0-9]*|linux-image-unsigned-[0-9]*|linux-image-extra-[0-9]*|\
+        linux-headers-[0-9]*|linux-modules-[0-9]*|linux-modules-extra-[0-9]*|\
+        linux-tools-[0-9]*|linux-cloud-tools-[0-9]*|linux-restricted-modules-[0-9]*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+is_kernel_autoremove_protected_package() {
+    local package="${1%%:*}"
+
+    is_versioned_kernel_package "$package" || \
+        is_kernel_meta_package_name "$package" || \
+        is_kernel_cleanup_meta_package "$package"
 }
 
 kernel_meta_route_and_flavor() {
@@ -2081,14 +2254,11 @@ collect_package_cleanup_candidates() {
         printf '%s\n' "$simulation_output" | parse_apt_simulated_removals
     )
     for package in "${simulated_packages[@]}"; do
-        case "$package" in
-            linux-image-*|linux-headers-*|linux-modules-*)
-                AUTOREMOVE_KERNEL_PACKAGES+=("$package")
-                ;;
-            *)
-                AUTOREMOVE_PACKAGES+=("$package")
-                ;;
-        esac
+        if is_kernel_autoremove_protected_package "$package"; then
+            AUTOREMOVE_KERNEL_PACKAGES+=("$package")
+        else
+            AUTOREMOVE_PACKAGES+=("$package")
+        fi
     done
 
     mapfile -t RESIDUAL_PACKAGES < <(
@@ -2113,11 +2283,51 @@ print_package_cleanup_candidates() {
     fi
 }
 
+validate_explicit_package_purge() {
+    local array_name="$1"
+    local label="$2"
+    local expected
+    local planned
+    local simulation_output
+    local -n expected_packages="$array_name"
+    local -a planned_packages=()
+
+    (( ${#expected_packages[@]} > 0 )) || return 0
+    if ! simulation_output=$(LC_ALL=C apt-get -s -o Debug::NoLocking=1 purge -- \
+        "${expected_packages[@]}" 2>&1); then
+        error "$label 的最终删除预览失败，已停止操作："
+        echo "$simulation_output"
+        return 1
+    fi
+    mapfile -t planned_packages < <(
+        printf '%s\n' "$simulation_output" | parse_apt_simulated_removals
+    )
+    if (( ${#planned_packages[@]} == 0 )); then
+        error "$label 的最终删除预览为空，已停止操作。"
+        return 1
+    fi
+    for planned in "${planned_packages[@]}"; do
+        if ! array_contains_package_name "$array_name" "$planned"; then
+            error "$label 的最终预览包含未确认的连带删除 $planned，已停止操作。"
+            return 1
+        fi
+    done
+    for expected in "${expected_packages[@]}"; do
+        if ! array_contains_package_name planned_packages "$expected"; then
+            error "$label 的最终预览缺少候选 $expected，已停止操作。"
+            return 1
+        fi
+    done
+}
+
 perform_package_cleanup() {
     local failed=0
 
     if (( ${#AUTOREMOVE_PACKAGES[@]} > 0 )); then
-        if apt-get purge -y -- "${AUTOREMOVE_PACKAGES[@]}"; then
+        if ! validate_explicit_package_purge AUTOREMOVE_PACKAGES "无用依赖包"; then
+            print_result "无用依赖包" "失败" "最终删除边界验证未通过"
+            failed=1
+        elif apt-get purge -y -- "${AUTOREMOVE_PACKAGES[@]}"; then
             print_result "无用依赖包" "已完成" "${#AUTOREMOVE_PACKAGES[@]} 个"
         else
             print_result "无用依赖包" "失败"
@@ -2128,7 +2338,10 @@ perform_package_cleanup() {
     fi
 
     if (( ${#RESIDUAL_PACKAGES[@]} > 0 )); then
-        if apt-get purge -y -- "${RESIDUAL_PACKAGES[@]}"; then
+        if ! validate_explicit_package_purge RESIDUAL_PACKAGES "残留配置包"; then
+            print_result "残留配置包" "失败" "最终删除边界验证未通过"
+            failed=1
+        elif apt-get purge -y -- "${RESIDUAL_PACKAGES[@]}"; then
             print_result "残留配置包" "已完成" "${#RESIDUAL_PACKAGES[@]} 个"
         else
             print_result "残留配置包" "失败"
@@ -2886,14 +3099,15 @@ show_reboot_notice() {
     current_kernel=$(uname -r)
     collect_installed_kernel_releases
     if (( ${#INSTALLED_KERNEL_RELEASES[@]} > 0 )); then
-        latest_kernel="${INSTALLED_KERNEL_RELEASES[-1]}"
+        latest_kernel=$(latest_installed_kernel_for_current_flavor \
+            "$current_kernel" "${INSTALLED_KERNEL_RELEASES[@]}" 2>/dev/null || true)
     fi
 
     if [[ -f /var/run/reboot-required ]]; then
         warn "系统提示需要重启；请先重启，再考虑清理旧内核。"
         [[ -f /var/run/reboot-required.pkgs ]] && sed 's/^/ - /' /var/run/reboot-required.pkgs
     elif [[ -n "$latest_kernel" && "$current_kernel" != "$latest_kernel" ]]; then
-        warn "当前运行内核 $current_kernel，最新已安装内核 $latest_kernel；请安排重启。"
+        warn "当前运行内核 $current_kernel，同类型最新已安装内核 $latest_kernel；请安排重启。"
     fi
 }
 
@@ -3006,7 +3220,9 @@ show_kernel_update_status() {
     fi
     collect_installed_kernel_releases
     if (( ${#INSTALLED_KERNEL_RELEASES[@]} > 0 )); then
-        latest_kernel="${INSTALLED_KERNEL_RELEASES[-1]}"
+        latest_kernel=$(latest_installed_kernel_for_current_flavor \
+            "$current_kernel" "${INSTALLED_KERNEL_RELEASES[@]}" 2>/dev/null || true)
+        [[ -n "$latest_kernel" ]] || latest_kernel="未识别"
     fi
     collect_installed_kernel_meta_packages
     [[ -d /boot ]] || boot_path="/"
@@ -3018,7 +3234,7 @@ show_kernel_update_status() {
     print_header "内核与重启状态"
     print_result "当前运行内核" "正常" "$current_kernel"
     print_result "内核软件包归属" "$([[ "$current_owner" == linux-image-* ]] && echo 正常 || echo 未识别)" "$current_owner"
-    print_result "最新已安装内核" "$([[ "$latest_kernel" == "未识别" ]] && echo 未识别 || echo 正常)" "$latest_kernel"
+    print_result "同类型最新已安装内核" "$([[ "$latest_kernel" == "未识别" ]] && echo 未识别 || echo 正常)" "$latest_kernel"
     print_result "重启状态" "$([[ "$reboot_state" == "需要" ]] && echo 需要 || echo 正常)" "$reboot_state"
     echo "已安装的受管内核版本："
     if (( ${#INSTALLED_KERNEL_RELEASES[@]} == 0 )); then
@@ -3243,7 +3459,9 @@ submenu_updates() {
         latest_kernel="未识别"
         collect_installed_kernel_releases
         if (( ${#INSTALLED_KERNEL_RELEASES[@]} > 0 )); then
-            latest_kernel="${INSTALLED_KERNEL_RELEASES[-1]}"
+            latest_kernel=$(latest_installed_kernel_for_current_flavor \
+                "$current_kernel" "${INSTALLED_KERNEL_RELEASES[@]}" 2>/dev/null || true)
+            [[ -n "$latest_kernel" ]] || latest_kernel="未识别"
         fi
         reboot_state="无需重启"
         if [[ -f /var/run/reboot-required ]] || \
@@ -3253,7 +3471,7 @@ submenu_updates() {
 
         print_header "系统更新"
         echo -e "  当前内核：${YELLOW}$current_kernel${NC}"
-        echo -e "  最新已安装：${YELLOW}$latest_kernel${NC}  |  状态：${YELLOW}$reboot_state${NC}"
+        echo -e "  同类型最新已安装：${YELLOW}$latest_kernel${NC}  |  状态：${YELLOW}$reboot_state${NC}"
         echo -e "${DIM}--------------------------------------------------${NC}"
         print_menu_item 1 "检查可用更新" "只刷新索引并预览"
         print_menu_item 2 "常规软件包升级" "只升级已有包，不新增、不删除"
@@ -3308,12 +3526,15 @@ submenu_env() {
 # ==========================================
 submenu_ssh() {
     local fail2ban_synced
+    local configured_ports
 
     require_commands "SSH 配置" sshd ss systemctl timeout awk sed grep mktemp || { pause_menu; return; }
     while true; do
         print_header "SSH 端口与登录设置"
         CURRENT_PORT=$(get_ssh_port)
         [[ -z "$CURRENT_PORT" ]] && CURRENT_PORT="未知"
+        configured_ports=$(get_configured_ssh_ports)
+        [[ -z "$configured_ports" ]] && configured_ports="未知"
         LISTENING_PORTS=$(get_listening_ssh_ports)
         [[ -z "$LISTENING_PORTS" ]] && LISTENING_PORTS="未检测到"
         
@@ -3324,7 +3545,7 @@ submenu_ssh() {
             *) PWD_STATUS="${YELLOW}未知（请先检查 sshd 配置）${NC}" ;;
         esac
         
-        echo -e "配置的 SSH 端口: ${YELLOW}$CURRENT_PORT${NC}"
+        echo -e "配置的 SSH 端口: ${YELLOW}$configured_ports${NC}"
         echo -e "实际监听端口:     ${YELLOW}$LISTENING_PORTS${NC}"
         echo -e "密码登录状态:     $PWD_STATUS"
         echo -e "${DIM}--------------------------------------------------${NC}"
@@ -3336,13 +3557,13 @@ submenu_ssh() {
 
         case "$choice_ssh" in
             1)
-                read -r -p "请输入新的 SSH 端口号 (10000-65535): " new_port
-                if [[ ! "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 10000 ] || [ "$new_port" -gt 65535 ]; then
-                    error "端口号无效！请输入 10000 到 65535 之间的纯数字。"
+                read -r -p "请输入新的 SSH 端口号 (22 或 1024-65535): " new_port
+                if ! is_valid_ssh_port "$new_port"; then
+                    error "端口号无效！请输入 22，或 1024 到 65535 之间的纯数字。"
                     pause_menu; continue
                 fi
 
-                if [[ "$new_port" == "$CURRENT_PORT" ]]; then
+                if [[ "$configured_ports" == "$new_port" && "$LISTENING_PORTS" == "$new_port" ]]; then
                     log "SSH 当前已配置为端口 $new_port，无需修改。"
                     pause_menu; continue
                 fi
@@ -3366,7 +3587,8 @@ submenu_ssh() {
                     pause_menu; continue
                 fi
 
-                if ! sshd -t 2>/dev/null || [[ "$(get_ssh_port)" != "$new_port" ]]; then
+                configured_ports=$(get_configured_ssh_ports)
+                if ! sshd -t 2>/dev/null || [[ "$configured_ports" != "$new_port" ]]; then
                     rollback_ssh_with_message "SSH 语法或生效配置验证失败"
                     pause_menu; continue
                 fi
@@ -3377,10 +3599,11 @@ submenu_ssh() {
                 fi
 
                 sleep 1
+                configured_ports=$(get_configured_ssh_ports)
                 LISTENING_PORTS=$(get_listening_ssh_ports)
-                if ! tr ',' '\n' <<< "$LISTENING_PORTS" | grep -Fxq "$new_port" || \
-                   ! timeout 3 bash -c "</dev/tcp/127.0.0.1/$new_port" 2>/dev/null; then
-                    rollback_ssh_with_message "端口 $new_port 未通过实际监听验证"
+                if ! ssh_uses_only_port "$new_port" "$configured_ports" "$LISTENING_PORTS" || \
+                   ! ssh_port_accepts_loopback "$new_port"; then
+                    rollback_ssh_with_message "SSH 未能仅监听目标端口 $new_port（配置=${configured_ports:-未知}；监听=${LISTENING_PORTS:-未检测到}）"
                     pause_menu; continue
                 fi
 
@@ -4284,6 +4507,19 @@ verify_ipv6_runtime_state() {
     done
 }
 
+current_ssh_session_uses_ipv6() {
+    local connection="${SSH_CONNECTION:-}"
+    local client_address
+    local client_port
+    local server_address
+    local server_port
+
+    [[ -n "$connection" ]] || return 1
+    read -r client_address client_port server_address server_port <<< "$connection"
+    [[ -n "$client_address" && -n "$client_port" && -n "$server_address" && -n "$server_port" ]] || return 1
+    [[ "$server_address" == *:* ]]
+}
+
 configure_ipv6_state() {
     local target_value="$1"
     local action_label="禁用"
@@ -4291,6 +4527,10 @@ configure_ipv6_state() {
     local runtime_value
 
     [[ "$target_value" == "0" ]] && action_label="启用"
+    if [[ "$target_value" == "1" ]] && current_ssh_session_uses_ipv6; then
+        error "当前 SSH 会话通过 IPv6 连接，禁用 IPv6 会立即中断会话；请改用 IPv4 登录或云厂商控制台执行。"
+        return 1
+    fi
     IPV6_BACKUP_PATH="$BACKUP_DIR/ipv6-$(date +%Y%m%d%H%M%S)-$$"
     IPV6_FILE_EXISTED=0
     IPV6_RUNTIME_PATHS=()
@@ -4436,6 +4676,10 @@ submenu_ipv6() {
 # 模块三：网络配置
 # ==========================================
 submenu_net() {
+    local persistent_cc
+    local persistent_qdisc
+    local write_bbr
+
     require_commands "网络配置" sysctl ip timeout getent find readlink sort || { pause_menu; return; }
     while true; do
         print_header "网络配置"
@@ -4457,16 +4701,31 @@ submenu_net() {
             1) 
                 CURRENT_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
                 CURRENT_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+                persistent_cc=$(get_effective_sysctl_value net.ipv4.tcp_congestion_control)
+                persistent_qdisc=$(get_effective_sysctl_value net.core.default_qdisc)
 
                 if [[ "$CURRENT_CC" == "bbr" && "$CURRENT_QDISC" == "fq" ]]; then
-                    print_result "BBR / FQ" "跳过" "当前均已开启，未修改 sysctl 文件"
+                    if bbr_persistence_is_complete; then
+                        print_result "BBR / FQ" "跳过" "运行状态与持久化配置均已生效"
+                        pause_menu; continue
+                    fi
+                    warn "BBR 与 FQ 当前正在运行，但持久化配置不完整，重启后可能恢复为系统默认值。"
+                    echo "持久化检测：拥塞控制=${persistent_cc:-未定义}；默认队列=${persistent_qdisc:-未定义}。"
+                    if confirm_action "确认补齐 BBR 与 FQ 的持久化配置吗？"; then
+                        persist_bbr_settings "$CURRENT_CC" "$CURRENT_QDISC" 1
+                    fi
                     pause_menu; continue
                 fi
 
                 if [[ "$CURRENT_CC" == "bbr" ]]; then
+                    write_bbr=0
                     echo -e "${YELLOW}BBR 已开启，但当前默认队列为 ${CURRENT_QDISC:-未知}，不是 fq。${NC}"
-                    if confirm_action "确认只补充并启用 FQ 吗？"; then
-                        persist_bbr_settings "$CURRENT_CC" "$CURRENT_QDISC" 0
+                    if [[ "$persistent_cc" != "bbr" ]]; then
+                        write_bbr=1
+                        warn "当前 BBR 未发现有效持久化配置，将与 FQ 一并写入，确保重启后仍生效。"
+                    fi
+                    if confirm_action "$([[ "$write_bbr" == "1" ]] && printf '确认补齐并启用 BBR 与 FQ 吗？' || printf '确认只补充并启用 FQ 吗？')"; then
+                        persist_bbr_settings "$CURRENT_CC" "$CURRENT_QDISC" "$write_bbr"
                     fi
                     pause_menu; continue
                 fi

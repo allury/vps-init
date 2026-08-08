@@ -31,6 +31,7 @@ jobs:
           tests/test-dns-route-wait.sh
           tests/test-system-update.sh
           tests/test-kernel-cleanup.sh
+          tests/test-safety-boundaries.sh
           tests/test-live-kernel-metadata.sh
 
       - name: Test APT simulation parser
@@ -51,6 +52,9 @@ jobs:
       - name: Test kernel cleanup boundaries
         run: bash tests/test-kernel-cleanup.sh
 
+      - name: Test interactive safety boundaries
+        run: bash tests/test-safety-boundaries.sh
+
       - name: Install ShellCheck
         run: |
           sudo apt-get update
@@ -68,6 +72,7 @@ jobs:
           tests/test-dns-route-wait.sh
           tests/test-system-update.sh
           tests/test-kernel-cleanup.sh
+          tests/test-safety-boundaries.sh
           tests/test-live-kernel-metadata.sh
 
   debian-13:
@@ -95,6 +100,7 @@ jobs:
           tests/test-dns-route-wait.sh
           tests/test-system-update.sh
           tests/test-kernel-cleanup.sh
+          tests/test-safety-boundaries.sh
           tests/test-live-kernel-metadata.sh
 
       - name: Test APT simulation parser
@@ -115,6 +121,9 @@ jobs:
       - name: Test kernel cleanup boundaries
         run: bash tests/test-kernel-cleanup.sh
 
+      - name: Test interactive safety boundaries
+        run: bash tests/test-safety-boundaries.sh
+
       - name: Test live Debian kernel metadata
         run: bash tests/test-live-kernel-metadata.sh
 
@@ -127,4 +136,5 @@ jobs:
           tests/test-dns-route-wait.sh
           tests/test-system-update.sh
           tests/test-kernel-cleanup.sh
+          tests/test-safety-boundaries.sh
           tests/test-live-kernel-metadata.sh
