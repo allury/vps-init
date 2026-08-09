@@ -6296,12 +6296,12 @@ interfaces_file_is_loaded() {
 
     while IFS=$'\t' read -r directive source_path; do
         [[ -n "$directive" && -n "$source_path" ]] || continue
-        [[ "$source_path" =~ ^[[:alnum:]_./*?\[\]-]+$ ]] || continue
         if [[ "$source_path" != /* ]]; then
             source_path="$root_dir/$source_path"
         fi
         case "$directive" in
             source)
+                # compgen expands the configured glob without evaluating it as shell code.
                 while IFS= read -r matched_path; do
                     matched_path=$(readlink -m -- "$matched_path" 2>/dev/null || true)
                     [[ "$matched_path" == "$canonical_file" ]] && return 0
