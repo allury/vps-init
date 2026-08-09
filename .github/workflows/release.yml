@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Version tag to publish, for example 1.2.2
+        description: Semantic version tag to publish (X.Y.Z)
         required: true
         type: string
 
@@ -27,10 +27,10 @@ jobs:
   publish:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
@@ -57,6 +57,12 @@ jobs:
             exit 1
           fi
 
+          script_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' vps.sh)
+          if [[ "$script_version" != "$tag" ]]; then
+            echo "Tag $tag does not match vps.sh VERSION $script_version" >&2
+            exit 1
+          fi
+
           notes_file=".github/releases/${tag}.md"
           if [[ ! -f "$notes_file" ]]; then
             echo "Release notes not found: $notes_file" >&2
@@ -73,6 +79,14 @@ jobs:
             exit 1
           fi
 
+          git fetch --no-tags origin \
+            "+refs/heads/main:refs/remotes/origin/main"
+          if ! git merge-base --is-ancestor \
+              "refs/tags/${tag}^{commit}" refs/remotes/origin/main; then
+            echo "Release tag $tag is not contained in main" >&2
+            exit 1
+          fi
+
           if [[ "$EVENT_NAME" == "push" && "$REF_TYPE" == "branch" ]]; then
             tag_commit=$(git rev-parse "refs/tags/${tag}^{commit}")
             current_commit=$(git rev-parse HEAD)
@@ -86,6 +100,20 @@ jobs:
           echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "notes_file=$notes_file" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tagged source
+        if: steps.release.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+
+          bash -n vps.sh tests/*.sh
+          for test_file in tests/test-*.sh; do
+            if [[ "$test_file" == "tests/test-live-kernel-metadata.sh" ]]; then
+              continue
+            fi
+            echo "Running ${test_file}"
+            bash "${test_file}"
+          done
 
       - name: Create or synchronize Release
         if: steps.release.outputs.skip != 'true'

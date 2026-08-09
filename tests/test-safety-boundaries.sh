@@ -76,6 +76,48 @@ if swap_removal_capacity_is_safe $((192 * 1024 * 1024)) $((128 * 1024 * 1024)) \
     fail_test "SWAP removal without memory headroom was accepted"
 fi
 
+FSTAB_NEWLINE_TEST="$TEST_DIR/fstab-newline"
+printf '/dev/root / ext4 defaults 0 1' > "$FSTAB_NEWLINE_TEST"
+ensure_text_file_ends_with_newline "$FSTAB_NEWLINE_TEST" || \
+    fail_test "an unterminated fstab line could not be normalized"
+printf '/swapfile none swap sw 0 0 # managed by vps-init\n' >> "$FSTAB_NEWLINE_TEST"
+[[ "$(wc -l < "$FSTAB_NEWLINE_TEST")" == "2" ]] || \
+    fail_test "a SWAP fstab entry was joined to an unterminated previous line"
+ensure_text_file_ends_with_newline "$FSTAB_NEWLINE_TEST" || \
+    fail_test "a terminated fstab file was rejected"
+[[ "$(wc -l < "$FSTAB_NEWLINE_TEST")" == "2" ]] || \
+    fail_test "newline normalization added an extra blank line"
+
+SWAP_TEST_FSTAB="$TEST_DIR/fstab"
+printf '# no swap\n' > "$SWAP_TEST_FSTAB"
+SWAPON_TEST_OUTPUT=""
+swapon() {
+    printf '%s' "$SWAPON_TEST_OUTPUT"
+}
+if system_has_any_swap_configuration "$SWAP_TEST_FSTAB"; then
+    fail_test "an empty swap configuration was classified as existing SWAP"
+fi
+SWAPON_TEST_OUTPUT='/dev/zram0\n'
+system_has_any_swap_configuration "$SWAP_TEST_FSTAB" || \
+    fail_test "an active non-file SWAP was not detected"
+SWAPON_TEST_OUTPUT=""
+printf '/swapfile none swap sw 0 0\n' > "$SWAP_TEST_FSTAB"
+system_has_any_swap_configuration "$SWAP_TEST_FSTAB" || \
+    fail_test "a persistent fstab SWAP was not detected"
+
+SWAP_SYSCTL_FILE="$TEST_DIR/swap-user.conf"
+printf 'vm.swappiness = 25\n' > "$SWAP_SYSCTL_FILE"
+sysctl() {
+    if [[ "$1" == "-n" && "$2" == "vm.swappiness" ]]; then
+        printf '25\n'
+        return 0
+    fi
+    return 1
+}
+remove_managed_swappiness || fail_test "unmanaged swappiness preservation failed"
+grep -Fxq 'vm.swappiness = 25' "$SWAP_SYSCTL_FILE" || \
+    fail_test "an unmarked user swappiness setting was modified"
+
 PERSISTENT_CC=''
 PERSISTENT_QDISC=''
 get_effective_sysctl_value() {
@@ -100,12 +142,39 @@ for package in \
     linux-cloud-tools-6.12.96+deb13-amd64 \
     linux-restricted-modules-6.12.96+deb13-amd64 \
     linux-image-amd64 \
-    linux-headers-amd64; do
+    linux-headers-amd64 \
+    linux-base \
+    linux-firmware \
+    initramfs-tools \
+    initramfs-tools-core \
+    amd64-microcode \
+    intel-microcode; do
     is_kernel_autoremove_protected_package "$package" || \
         fail_test "kernel package $package was not protected from regular cleanup"
 done
 if is_kernel_autoremove_protected_package libc6; then
     fail_test "a non-kernel package was protected from regular cleanup"
+fi
+
+APT_CLEANUP_PREVIEW=$'Purg ordinary-unused [1.0]\nPurg linux-image-6.12.95+deb13-amd64 [6.12.95-1]'
+DPKG_CLEANUP_STATUS=$'ordinary-residual\trc\nlinux-image-6.12.94+deb13-amd64\trc'
+apt-get() {
+    printf '%s\n' "$APT_CLEANUP_PREVIEW"
+}
+dpkg-query() {
+    printf '%s\n' "$DPKG_CLEANUP_STATUS"
+}
+collect_package_cleanup_candidates || fail_test "cleanup candidate classification failed"
+array_contains_value AUTOREMOVE_PACKAGES ordinary-unused || \
+    fail_test "an ordinary autoremove candidate was not retained"
+array_contains_value RESIDUAL_PACKAGES ordinary-residual || \
+    fail_test "an ordinary residual package was not retained"
+array_contains_value AUTOREMOVE_KERNEL_PACKAGES linux-image-6.12.95+deb13-amd64 || \
+    fail_test "an autoremove kernel was not separated"
+array_contains_value AUTOREMOVE_KERNEL_PACKAGES linux-image-6.12.94+deb13-amd64 || \
+    fail_test "a residual kernel package was not separated"
+if array_contains_value RESIDUAL_PACKAGES linux-image-6.12.94+deb13-amd64; then
+    fail_test "a residual kernel package entered regular cleanup"
 fi
 
 APT_PURGE_PREVIEW=$'Purg harmless-package [1.0]'
@@ -127,5 +196,7 @@ fi
 OS_ID=ubuntu
 is_kernel_autoremove_protected_package linux-aws || \
     fail_test "an Ubuntu kernel meta-package was not protected from regular cleanup"
+is_kernel_autoremove_protected_package linux-firmware-nvidia-550-server || \
+    fail_test "a flavor-specific firmware package was not protected from regular cleanup"
 
 echo "Safety boundary tests passed."

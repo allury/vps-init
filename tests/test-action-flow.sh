@@ -26,6 +26,16 @@ grep -Fq "未做任何更改" <<< "$cancel_output" || fail_test "cancellation sa
 confirm_output=$(confirm_action "Confirm test?" <<< "y") || fail_test "positive confirmation should succeed"
 [[ -z "$confirm_output" ]] || fail_test "positive confirmation should not add a cancellation result"
 
+UPDATE_REMOVE_PACKAGES=()
+confirm_update_plan_execution regular <<< "y" || \
+    fail_test "regular update confirmation was rejected"
+UPDATE_REMOVE_PACKAGES=(obsolete-package)
+confirm_update_plan_execution full <<< $'y\ny' || \
+    fail_test "full update removal plan was rejected after two confirmations"
+if confirm_update_plan_execution full <<< $'y\nn'; then
+    fail_test "full update removal plan proceeded without the second confirmation"
+fi
+
 success_output=$(action_success "测试操作" "验证通过")
 grep -Fq "测试操作" <<< "$success_output" || fail_test "success label was not displayed"
 grep -Fq "已完成" <<< "$success_output" || fail_test "success state was not displayed"
@@ -35,5 +45,45 @@ partial_output=$(action_partial "测试操作" "附属步骤失败")
 grep -Fq "部分完成" <<< "$partial_output" || fail_test "partial state was not displayed"
 grep -Fq "[WARN] 测试操作 部分完成：附属步骤失败" "$LOG_FILE" || \
     fail_test "partial result was not logged as a warning"
+
+SNAP_TEST_OUTPUT=$'Name Version Rev Tracking Publisher Notes\ncore20 2026 100 latest/stable canonical** disabled\ncore22 2026 200 latest/stable canonical** -'
+SNAP_TEST_STATUS=0
+SNAP_REMOVE_CAPTURE="$TEST_DIR/snap-removals"
+timeout() {
+    shift
+    "$@"
+}
+snap() {
+    case "$1" in
+        list)
+            printf '%s\n' "$SNAP_TEST_OUTPUT"
+            return "$SNAP_TEST_STATUS"
+            ;;
+        remove)
+            printf '%s\n' "$*" >> "$SNAP_REMOVE_CAPTURE"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+snap_cleanup_output=$(cleanup_disabled_snaps <<< "y") || \
+    fail_test "a valid disabled Snap revision could not be cleaned"
+grep -Fq $'core20\t100' <<< "$snap_cleanup_output" || \
+    fail_test "disabled Snap preview did not retain the package and revision"
+grep -Fxq 'remove core20 --revision=100' "$SNAP_REMOVE_CAPTURE" || \
+    fail_test "only the disabled Snap revision was not passed to snap remove"
+if grep -Fq 'core22' "$SNAP_REMOVE_CAPTURE"; then
+    fail_test "an active Snap revision entered cleanup"
+fi
+
+SNAP_TEST_STATUS=1
+SNAP_TEST_OUTPUT='snapd unavailable'
+if snap_failure_output=$(cleanup_disabled_snaps); then
+    fail_test "Snap cleanup proceeded after the revision list failed"
+fi
+grep -Fq '未执行任何删除' <<< "$snap_failure_output" || \
+    fail_test "Snap list failure was not reported as a safe stop"
+grep -Fq '[DETAIL] [CLEANUP][SNAP_LIST] 退出码=1' "$LOG_FILE" || \
+    fail_test "Snap list failure details were not logged"
 
 echo "Action flow tests passed."

@@ -15,126 +15,73 @@ concurrency:
 
 jobs:
   shell:
-    name: Bash syntax and ShellCheck
+    name: Bash syntax, tests and ShellCheck
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Check Bash syntax
-        run: >-
-          bash -n vps.sh
-          tests/test-apt-simulation-parser.sh
-          tests/test-logging.sh
-          tests/test-action-flow.sh
-          tests/test-dns-route-wait.sh
-          tests/test-system-update.sh
-          tests/test-kernel-cleanup.sh
-          tests/test-safety-boundaries.sh
-          tests/test-live-kernel-metadata.sh
-
-      - name: Test APT simulation parser
-        run: bash tests/test-apt-simulation-parser.sh
-
-      - name: Test diagnostic logging
-        run: bash tests/test-logging.sh
-
-      - name: Test action flow
-        run: bash tests/test-action-flow.sh
-
-      - name: Test DNS route recovery wait
-        run: bash tests/test-dns-route-wait.sh
-
-      - name: Test system update boundaries
-        run: bash tests/test-system-update.sh
-
-      - name: Test kernel cleanup boundaries
-        run: bash tests/test-kernel-cleanup.sh
-
-      - name: Test interactive safety boundaries
-        run: bash tests/test-safety-boundaries.sh
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install ShellCheck
         run: |
-          sudo apt-get update
+          sudo apt-get update \
+            -o Acquire::Retries=3 \
+            -o APT::Update::Error-Mode=any
           sudo apt-get install --yes shellcheck
 
-      - name: Test live Ubuntu kernel metadata
-        run: bash tests/test-live-kernel-metadata.sh
+      - name: Check Bash syntax
+        run: bash -n vps.sh tests/*.sh
+
+      - name: Run test suite
+        run: |
+          for test_file in tests/test-*.sh; do
+            echo "Running ${test_file}"
+            bash "${test_file}"
+          done
 
       - name: Run ShellCheck
-        run: >-
-          shellcheck --severity=error vps.sh
-          tests/test-apt-simulation-parser.sh
-          tests/test-logging.sh
-          tests/test-action-flow.sh
-          tests/test-dns-route-wait.sh
-          tests/test-system-update.sh
-          tests/test-kernel-cleanup.sh
-          tests/test-safety-boundaries.sh
-          tests/test-live-kernel-metadata.sh
+        run: shellcheck --severity=error vps.sh tests/*.sh
 
-  debian-13:
-    name: Debian 13 Bash compatibility
+  compatibility:
+    name: ${{ matrix.name }} compatibility
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Debian 12
+            image: debian:12-slim
+          - name: Debian 13
+            image: debian:13-slim
+          - name: Ubuntu 20.04
+            image: ubuntu:20.04
+          - name: Ubuntu 22.04
+            image: ubuntu:22.04
+          - name: Ubuntu 24.04
+            image: ubuntu:24.04
     container:
-      image: debian:13-slim
+      image: ${{ matrix.image }}
     steps:
       - name: Install test dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          apt-get update
+          apt-get update \
+            -o Acquire::Retries=3 \
+            -o APT::Update::Error-Mode=any
           apt-get install --yes --no-install-recommends \
-            bash ca-certificates git mawk shellcheck
+            bash ca-certificates coreutils findutils git grep iproute2 mawk procps sed util-linux
 
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Check Bash syntax
-        run: >-
-          bash -n vps.sh
-          tests/test-apt-simulation-parser.sh
-          tests/test-logging.sh
-          tests/test-action-flow.sh
-          tests/test-dns-route-wait.sh
-          tests/test-system-update.sh
-          tests/test-kernel-cleanup.sh
-          tests/test-safety-boundaries.sh
-          tests/test-live-kernel-metadata.sh
+        run: bash -n vps.sh tests/*.sh
 
-      - name: Test APT simulation parser
-        run: bash tests/test-apt-simulation-parser.sh
-
-      - name: Test diagnostic logging
-        run: bash tests/test-logging.sh
-
-      - name: Test action flow
-        run: bash tests/test-action-flow.sh
-
-      - name: Test DNS route recovery wait
-        run: bash tests/test-dns-route-wait.sh
-
-      - name: Test system update boundaries
-        run: bash tests/test-system-update.sh
-
-      - name: Test kernel cleanup boundaries
-        run: bash tests/test-kernel-cleanup.sh
-
-      - name: Test interactive safety boundaries
-        run: bash tests/test-safety-boundaries.sh
-
-      - name: Test live Debian kernel metadata
-        run: bash tests/test-live-kernel-metadata.sh
-
-      - name: Run ShellCheck
-        run: >-
-          shellcheck --severity=error vps.sh
-          tests/test-apt-simulation-parser.sh
-          tests/test-logging.sh
-          tests/test-action-flow.sh
-          tests/test-dns-route-wait.sh
-          tests/test-system-update.sh
-          tests/test-kernel-cleanup.sh
-          tests/test-safety-boundaries.sh
-          tests/test-live-kernel-metadata.sh
+      - name: Run test suite
+        run: |
+          for test_file in tests/test-*.sh; do
+            echo "Running ${test_file}"
+            bash "${test_file}"
+          done

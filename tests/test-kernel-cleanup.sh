@@ -85,6 +85,31 @@ assert_cleanup_meta linux-headers-cloud-amd64
 assert_not_cleanup_meta linux-image-6.12.99+deb13-cloud-amd64
 assert_not_cleanup_meta linux-headers-6.12.99+deb13-cloud-amd64
 assert_not_cleanup_meta linux-base
+assert_not_cleanup_meta linux-tools-common
+assert_not_cleanup_meta linux-cloud-tools-common
+
+parsed_records=$(printf '%s\n' \
+    $'linux-image-6.12.96+deb13-amd64:amd64\tii ' \
+    $'linux-image-6.12.95+deb13-amd64:amd64\trc ' \
+    $'linux-image-6.12.94+deb13-amd64:amd64\tun ' |
+    parse_kernel_package_records)
+[[ "$parsed_records" == $'linux-image-6.12.96+deb13-amd64\tii\nlinux-image-6.12.95+deb13-amd64\trc' ]] || \
+    fail_test "installed/residual kernel package record parsing is incorrect"
+
+RETAINED_KERNEL_RELEASES=(
+    6.12.96+deb13-amd64
+    6.12.95+deb13-amd64
+)
+kernel_versioned_package_matches_retained_release \
+    linux-image-6.12.96+deb13-amd64 || \
+    fail_test "current Debian image package was not protected"
+kernel_versioned_package_matches_retained_release \
+    linux-headers-6.12.96+deb13-common || \
+    fail_test "shared Debian headers for a retained release were not protected"
+if kernel_versioned_package_matches_retained_release \
+    linux-image-6.12.94+deb13-amd64; then
+    fail_test "old Debian image package was incorrectly protected"
+fi
 
 OS_ID=ubuntu
 assert_cleanup_meta linux-aws
@@ -95,6 +120,7 @@ assert_not_cleanup_meta linux-restricted-modules-6.8.0-200-aws
 assert_not_cleanup_meta linux-modules-extra-6.8.0-200-aws
 
 OLD_KERNEL_PACKAGES=(linux-image-6.12.99+deb13-cloud-amd64)
+RETAINED_KERNEL_RELEASES=(6.12.96+deb13-amd64)
 ACTIVE_KERNEL_META=linux-image-amd64
 APT_SIMULATED_OUTPUT=$'Purg linux-image-6.12.99+deb13-cloud-amd64 [6.12.99-1]\nRemv linux-image-cloud-amd64:amd64 [6.12.99-1]'
 OS_ID=debian
@@ -121,6 +147,13 @@ ACTIVE_KERNEL_META=""
 APT_SIMULATED_OUTPUT=$'Purg linux-image-6.12.99+deb13-cloud-amd64 [6.12.99-1]\nRemv linux-image-cloud-amd64 [6.12.99-1]'
 if validate_old_kernel_removal_plan; then
     fail_test "meta-package removal should be rejected when the active route is unknown"
+fi
+
+ACTIVE_KERNEL_META=linux-image-amd64
+OLD_KERNEL_PACKAGES=(linux-image-6.12.96+deb13-amd64)
+APT_SIMULATED_OUTPUT='Purg linux-image-6.12.96+deb13-amd64 [6.12.96-1]'
+if validate_old_kernel_removal_plan; then
+    fail_test "a retained running kernel package should be rejected even if it reaches the plan"
 fi
 
 echo "Kernel cleanup tests passed."
