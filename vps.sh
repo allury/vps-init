@@ -6279,6 +6279,7 @@ interfaces_file_is_loaded() {
     local canonical_file
     local directive
     local source_path
+    local matched_path
     local normalized_pattern
     local file_dir
     local file_name
@@ -6299,13 +6300,16 @@ interfaces_file_is_loaded() {
         if [[ "$source_path" != /* ]]; then
             source_path="$root_dir/$source_path"
         fi
-        normalized_pattern=$(readlink -m -- "$source_path" 2>/dev/null || true)
-        [[ -n "$normalized_pattern" ]] || continue
         case "$directive" in
             source)
-                [[ "$canonical_file" == $normalized_pattern ]] && return 0
+                while IFS= read -r matched_path; do
+                    matched_path=$(readlink -m -- "$matched_path" 2>/dev/null || true)
+                    [[ "$matched_path" == "$canonical_file" ]] && return 0
+                done < <(compgen -G "$source_path" || true)
                 ;;
             source-directory)
+                normalized_pattern=$(readlink -m -- "$source_path" 2>/dev/null || true)
+                [[ -n "$normalized_pattern" ]] || continue
                 if [[ "$file_dir" == $normalized_pattern && \
                       "$file_name" =~ ^[A-Za-z0-9_-]+$ ]]; then
                     return 0
