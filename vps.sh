@@ -3250,12 +3250,12 @@ format_bytes() {
     else
         awk -v value="$bytes" 'BEGIN {
             split("B KiB MiB GiB TiB", units, " ")
-            index=1
-            while (value >= 1024 && index < 5) {
+            unit_index=1
+            while (value >= 1024 && unit_index < 5) {
                 value /= 1024
-                index++
+                unit_index++
             }
-            printf "%.1f%s", value, units[index]
+            printf "%.1f%s", value, units[unit_index]
         }'
     fi
 }
@@ -6315,8 +6315,8 @@ interfaces_file_is_loaded() {
     done < <(
         awk '
             $1 == "source" || $1 == "source-directory" {
-                for (index=2; index<=NF; index++) {
-                    print $1 "\t" $index
+                for (field_index=2; field_index<=NF; field_index++) {
+                    print $1 "\t" $field_index
                 }
             }
         ' "$root_file"
