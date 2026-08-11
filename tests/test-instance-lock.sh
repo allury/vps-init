@@ -81,15 +81,18 @@ bash -c '
 ' _ "$SCRIPT_DIR/../vps.sh" "$INSTANCE_LOCK_FILE" || \
     fail_test "lock was not reusable after TERM"
 
-# SIGKILL cannot execute a shell trap. The kernel must still release flock so
-# stale PID text cannot permanently block later runs.
+# SIGKILL cannot execute a shell trap. Use a Bash built-in loop so no external
+# child inherits fd 9: once the actual lock owner dies, the kernel must release
+# flock and stale PID text must not permanently block later runs. A live child
+# that inherited fd 9 is intentionally allowed to retain the lock until that
+# child finishes, because it may still be modifying system state.
 rm -f -- "$READY_FILE"
 bash -c '
     source "$1"
     INSTANCE_LOCK_FILE="$2"
     acquire_instance_lock
     printf ready > "$3"
-    while true; do sleep 1; done
+    while true; do :; done
 ' _ "$SCRIPT_DIR/../vps.sh" "$INSTANCE_LOCK_FILE" "$READY_FILE" &
 child_pid=$!
 for _ in {1..20}; do
