@@ -1,73 +1,92 @@
-# VPS Hardening Toolkit
+# vps-init
 
-[![Quality](https://github.com/allury/vps-init/actions/workflows/quality.yml/badge.svg)](https://github.com/allury/vps-init/actions/workflows/quality.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+面向 Debian VPS 的交互式初始化、安全加固与日常维护脚本。当前版本为 **2.0.0**。
 
-面向 Debian 和 Ubuntu VPS 的交互式初始化与安全加固脚本。当前版本为 **1.2.3**，集中提供系统更新、系统清理、SWAP、时区、SSH、Fail2ban、BBR、DNS 和 IPv6 等常用运维操作。
+项目遵循以下原则：
 
-> [!WARNING]
-> 本项目会修改 SSH、网络、内核及系统服务配置。运行前请创建快照、确认云厂商控制台可用，并保留一个已登录的备用会话。请先在测试实例验证，再用于生产环境。
-
-## 功能
-
-- 独立的系统更新与分级清理
-- SWAP 创建、检查与删除
-- 时区配置与唯一时间同步服务检查
-- SSH 端口及密钥登录加固
-- Fail2ban 安装与规则配置
-- BBR 与 FQ 队列配置
-- DNS 同步兼容 systemd-resolved、Netplan 和已加载的 interfaces/cloud-init 配置
-- IPv4/IPv6 优先级和 IPv6 开关
-- SSH、Fail2ban、SWAP、DNS 和 IPv6 的配置校验与失败回滚
-- Ubuntu 24.04+ `ssh.socket` 处理、真实监听端口检测和 Fail2ban 端口同步
-- BBR、SSH、DNS、IPv6、SWAP 与 Fail2ban 关键状态汇总
-- 旧内核安全保留清理，以及仅保留当前运行内核的高风险高级清理
+> Debian-only、保守修改、明确验证、失败回滚、日志可诊断。
 
 ## 支持范围
 
-| 系统 | 版本 | 状态 |
+| 系统 | 代号 | 架构 |
 | --- | --- | --- |
-| Debian | 12 / 13 | 支持；Debian 12 已进入 LTS，软件包覆盖范围需单独核对 |
-| Ubuntu | 20.04 | 支持；需有效的 Ubuntu Pro 合同并启用 ESM Infra |
-| Ubuntu | 22.04 / 24.04 | 支持 |
+| Debian 12 | Bookworm | amd64、arm64 |
+| Debian 13 | Trixie | amd64、arm64 |
 
-脚本只接受上述版本对应的官方代号，并检查当前架构和维护阶段。Ubuntu 20.04 安装 Fail2ban 时还需启用 ESM Apps。其他发行版、容器内非 systemd 环境以及已经结束安全维护的系统不会自动放行。
+脚本会核对 `/etc/os-release` 中的版本与代号、`dpkg` 架构、systemd 运行环境和系统维护阶段。范围外系统会直接停止，不尝试兼容。
 
-脚本依赖 Bash、systemd 和 Debian 系软件包管理工具。GitHub Actions 会在 Debian 12、Debian 13、Ubuntu 20.04、Ubuntu 22.04 和 Ubuntu 24.04 官方容器中执行 Bash 语法、回归测试与内核元数据检查；涉及真实 systemd、SSH 和网络状态的写入仍应先在可恢复的 VPS 上验证。
+## 主要功能
 
-## 快速开始
+- 系统维护：APT 更新检查、常规升级、完整升级、Debian 官方内核更新
+- 系统清理：APT 缓存、无用依赖、残留配置、旧内核和 systemd 日志
+- SWAP：查看状态、创建 1G/2G/自定义 swapfile、设置 `vm.swappiness`、删除脚本托管的 `/swapfile`
+- 时间：设置 `Asia/Shanghai` 并检查可用的 systemd 时间同步服务
+- SSH：查看或修改端口、检查 root 密钥登录、禁用密码和键盘交互登录
+- Fail2ban：在现有 `jail.local` 中增量维护 `sshd` jail，并验证运行参数与端口
+- BBR：仅配置 `fq` 与 `bbr`，不写入额外 TCP 调优参数
+- DNS：支持 systemd-resolved、ifupdown 和静态 `/etc/resolv.conf`
+- IPv6：查看、启用、禁用及设置 IPv4 地址选择优先级
+- 诊断：关键状态汇总、只读配置检查和最近运行日志
 
-请先阅读脚本，再以 `root` 权限运行：
+## 安全边界
+
+涉及系统状态的操作按 `PRECHECK → BACKUP → APPLY → VERIFY → ROLLBACK` 组织。脚本不会自动接管无法可靠判断所有权的配置。
+
+- APT 软件包来源通过 Debian Release 元数据中的 Origin、Suite、Codename 和 component 校验，不限制官方镜像站域名
+- 拒绝 testing、unstable、sid 和 Bookworm/Trixie 跨版本混源进入自动安装或升级流程
+- SSH 修改后检查 `sshd -t`、最终有效配置、`ssh.service`、监听端口及本机 SSH 协议握手
+- Fail2ban 重启后最多等待 15 秒就绪，并验证 sshd jail、封禁参数和实际端口
+- SWAP 创建按文件系统处理 ext4、XFS 和 Btrfs，每个阶段独立检查并在失败时回滚
+- IPv6 SSH 会话中禁止直接关闭 IPv6
+- NetworkManager、未知解析器所有权、多出口或复杂网络拓扑下不自动修改 DNS
+- 旧内核清理始终保护当前运行内核，并在执行前展示 APT 删除预览
+- 单实例锁使用 `flock`；进程正常退出、信号退出或异常终止后锁都会由内核释放
+
+高风险操作前仍建议创建云平台快照，并确认控制台或救援模式可用。
+
+## 使用方法
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/allury/vps-init/main/vps.sh -o vps.sh
+curl -fsSLo vps.sh https://raw.githubusercontent.com/allury/vps-init/main/vps.sh
 chmod +x vps.sh
 sudo ./vps.sh
 ```
 
-不建议直接使用 `curl | bash`，因为这会跳过运行前审查。
-
-## 运行前检查
-
-1. 为 VPS 创建可恢复的快照。
-2. 确认能够通过云厂商控制台或救援模式登录。
-3. 将 SSH 公钥写入 `/root/.ssh/authorized_keys`。
-4. 修改 SSH 端口时，同步更新安全组和防火墙规则。
-5. 在关闭当前 SSH 会话前，用新会话验证登录。
-6. 保持官方软件源可用；复杂网络拓扑、NetworkManager 或旧版 Netplan 环境需要由管理员手动配置 DNS。
-
-脚本日志默认写入 `/var/log/vps_init.log`，权限为 `0600`，并进行大小限制和敏感字段脱敏；不可写时会回退到随机命名的 `/tmp/vps_init-<UID>.*.log`。配置备份保存在 `/var/backups/vps-init/`。
-
-## 开发与检查
+运行前可先检查下载内容：
 
 ```bash
-bash -n vps.sh
-for test_file in tests/test-*.sh; do bash "$test_file"; done
-shellcheck --severity=error vps.sh tests/*.sh
+sed -n '1,220p' vps.sh
 ```
 
-提交代码前请阅读 [贡献指南](CONTRIBUTING.md)。安全问题请按 [安全策略](SECURITY.md) 私下报告，不要公开创建 Issue。
+## 日志
 
-## 许可证
+日志默认写入：
 
-本项目采用 [MIT License](LICENSE)。
+```text
+/var/log/vps_init.log
+```
+
+文件权限为 `600`，超过 1 MiB 时自动保留最近 1000 行。DETAIL 日志记录模块、阶段、退出码和必要的截断输出，不记录密码、Token 或密钥内容。
+
+查看最近日志：
+
+```bash
+sudo tail -n 100 /var/log/vps_init.log
+```
+
+## 从 1.2.x 升级
+
+2.0.0 只支持 Debian 12/13 amd64/arm64。原有 Debian 配置会继续按配置所有权和加载顺序检测；脚本不会主动删除旧版本遗留文件。若检测到无法证明安全的旧配置、复杂 DNS 所有权或冲突的 sysctl 定义，会停止并给出日志提示。
+
+## 质量检查
+
+GitHub Actions 在 Debian 12 与 Debian 13 官方容器中执行：
+
+- `bash -n`
+- ShellCheck error 级别检查
+- 全部离线回归测试
+- SWAP、Fail2ban、SSH、BBR/sysctl、APT、内核清理、DNS、日志与安全边界测试
+
+## License
+
+[MIT](LICENSE)

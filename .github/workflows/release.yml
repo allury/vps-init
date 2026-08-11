@@ -108,9 +108,6 @@ jobs:
 
           bash -n vps.sh tests/*.sh
           for test_file in tests/test-*.sh; do
-            if [[ "$test_file" == "tests/test-live-kernel-metadata.sh" ]]; then
-              continue
-            fi
             echo "Running ${test_file}"
             bash "${test_file}"
           done

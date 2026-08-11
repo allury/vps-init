@@ -20,7 +20,7 @@ body:
     id: os
     attributes:
       label: 相关操作系统
-      placeholder: Debian 13 / Ubuntu 24.04 / 全部
+      placeholder: Debian 12 / Debian 13 / 全部
   - type: textarea
     id: alternatives
     attributes:

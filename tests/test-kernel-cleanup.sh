@@ -70,23 +70,12 @@ if build_old_kernel_release_plan keep-fallback 6.12.96+deb13-amd64 \
     fail_test "cleanup should stop when a newer running-flavor kernel is installed"
 fi
 
-OS_ID=ubuntu
-build_old_kernel_release_plan keep-fallback 6.8.0-136-generic \
-    6.8.0-135-generic \
-    6.8.0-136-generic \
-    6.8.0-200-aws || \
-    fail_test "Ubuntu mixed-route fallback plan was rejected"
-assert_array_set RETAINED_KERNEL_RELEASES $'6.8.0-135-generic\n6.8.0-136-generic'
-assert_array_set OLD_KERNEL_RELEASES '6.8.0-200-aws'
-
 OS_ID=debian
 assert_cleanup_meta linux-image-cloud-amd64
 assert_cleanup_meta linux-headers-cloud-amd64
 assert_not_cleanup_meta linux-image-6.12.99+deb13-cloud-amd64
 assert_not_cleanup_meta linux-headers-6.12.99+deb13-cloud-amd64
 assert_not_cleanup_meta linux-base
-assert_not_cleanup_meta linux-tools-common
-assert_not_cleanup_meta linux-cloud-tools-common
 
 parsed_records=$(printf '%s\n' \
     $'linux-image-6.12.96+deb13-amd64:amd64\tii ' \
@@ -110,14 +99,6 @@ if kernel_versioned_package_matches_retained_release \
     linux-image-6.12.94+deb13-amd64; then
     fail_test "old Debian image package was incorrectly protected"
 fi
-
-OS_ID=ubuntu
-assert_cleanup_meta linux-aws
-assert_cleanup_meta linux-headers-aws
-assert_cleanup_meta linux-restricted-modules-aws
-assert_cleanup_meta linux-modules-extra-aws
-assert_not_cleanup_meta linux-restricted-modules-6.8.0-200-aws
-assert_not_cleanup_meta linux-modules-extra-6.8.0-200-aws
 
 OLD_KERNEL_PACKAGES=(linux-image-6.12.99+deb13-cloud-amd64)
 RETAINED_KERNEL_RELEASES=(6.12.96+deb13-amd64)

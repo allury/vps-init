@@ -138,9 +138,6 @@ fi
 OS_ID=debian
 for package in \
     linux-image-6.12.96+deb13-amd64 \
-    linux-tools-6.12.96+deb13-amd64 \
-    linux-cloud-tools-6.12.96+deb13-amd64 \
-    linux-restricted-modules-6.12.96+deb13-amd64 \
     linux-image-amd64 \
     linux-headers-amd64 \
     linux-base \
@@ -193,10 +190,10 @@ if validate_explicit_package_purge AUTOREMOVE_PACKAGES "test cleanup"; then
     fail_test "a package purge preview missing the requested package was accepted"
 fi
 
-OS_ID=ubuntu
-is_kernel_autoremove_protected_package linux-aws || \
-    fail_test "an Ubuntu kernel meta-package was not protected from regular cleanup"
-is_kernel_autoremove_protected_package linux-firmware-nvidia-550-server || \
-    fail_test "a flavor-specific firmware package was not protected from regular cleanup"
+OS_ID=debian
+is_kernel_autoremove_protected_package linux-image-amd64 || \
+    fail_test "the active Debian kernel meta-package was not protected from regular cleanup"
+is_kernel_autoremove_protected_package linux-firmware || \
+    fail_test "Debian kernel firmware was not protected from regular cleanup"
 
 echo "Safety boundary tests passed."

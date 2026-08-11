@@ -19,7 +19,7 @@ shellcheck --severity=error vps.sh
 
 还应至少验证：
 
-- Debian 与 Ubuntu 分支不会互相误触发；
+- Debian 12/13 与 amd64/arm64 范围判断不会误放行其他系统或架构；
 - SSH 配置通过 `sshd -t` 后才重启服务；
 - 网络或 SSH 变更失败时保留可恢复路径；
 - 重复执行不会产生明显的重复配置；

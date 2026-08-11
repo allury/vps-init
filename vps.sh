@@ -16,17 +16,15 @@ LOG_KEEP_LINES="${VPS_INIT_LOG_KEEP_LINES:-1000}"
 LOG_DETAIL_LIMIT=2048
 DNS_ROUTE_V4_WAIT_SECONDS="${VPS_INIT_DNS_ROUTE_V4_WAIT_SECONDS:-10}"
 DNS_ROUTE_V6_WAIT_SECONDS="${VPS_INIT_DNS_ROUTE_V6_WAIT_SECONDS:-30}"
-NETPLAN_DNS_MANAGED_MARKER="# Managed by vps-init: DNS override"
 IPV6_SYSCTL_FILE="/etc/sysctl.d/99-zz-vps-init-ipv6.conf"
 SWAP_SYSCTL_FILE="/etc/sysctl.d/99-zz-vps-init-swap.conf"
-SSH_MANAGED_FILE="/etc/ssh/sshd_config.d/00-00-vps-init.conf"
-SSH_SOCKET_SERVICE_DROPIN="/etc/systemd/system/ssh.service.d/00-socket.conf"
-SSH_SOCKET_ADDRESS_DROPIN="/etc/systemd/system/ssh.socket.d/addresses.conf"
-SSH_SOCKET_GENERATOR_MASK="/etc/systemd/system-generators/sshd-socket-generator"
+SSHD_CONFIG_FILE="${VPS_INIT_SSHD_CONFIG_FILE:-/etc/ssh/sshd_config}"
+SSH_MANAGED_FILE="${VPS_INIT_SSH_MANAGED_FILE:-/etc/ssh/sshd_config.d/00-00-vps-init.conf}"
 GAI_MANAGED_BEGIN="# BEGIN vps-init IPv4 preference"
 GAI_MANAGED_END="# END vps-init IPv4 preference"
-VERSION="1.2.3"
-MANAGED_SWAP_FILE="/swapfile"
+VERSION="2.0.0"
+MANAGED_SWAP_FILE="${VPS_INIT_SWAP_FILE:-/swapfile}"
+FSTAB_FILE="${VPS_INIT_FSTAB_FILE:-/etc/fstab}"
 BACKUP_DIR="/var/backups/vps-init"
 declare -a DNS_RESOLVED_LINKS=()
 declare -A DNS_LINK_DNS_BEFORE=()
@@ -35,6 +33,9 @@ DNS_INTERFACES_CONFIGURED=0
 DNS_INTERFACES_FILE=""
 DNS_INTERFACES_METHOD=""
 LEGACY_SYSCTL_CONF_STANDALONE=0
+INSTANCE_LOCK_FILE="/run/lock/vps-init.lock"
+INSTANCE_LOCK_HELD=0
+SYSCTL_SCAN_ROOT="${VPS_INIT_SYSCTL_SCAN_ROOT:-}"
 
 if [[ -t 1 && "${TERM:-}" != "dumb" && -z "${NO_COLOR:-}" ]]; then
     RED='\033[0;31m'
@@ -382,35 +383,13 @@ tcp_port_is_listening() {
 
 get_listening_ssh_ports() {
     local configured_ports
-    local endpoint
     local port
-    local socket_state
     local -a configured_candidates=()
     local -a trusted_candidates=()
     local -a listening_ports=()
 
     configured_ports=$(get_configured_ssh_ports)
     IFS=',' read -r -a configured_candidates <<< "$configured_ports"
-
-    socket_state=$(systemctl is-active ssh.socket 2>/dev/null || true)
-    if [[ "$socket_state" == "active" ]]; then
-        while IFS= read -r endpoint; do
-            [[ -n "$endpoint" ]] || continue
-            port="${endpoint##*:}"
-            [[ "$port" == "$endpoint" ]] && port="${endpoint#[}"
-            port="${port%]}"
-            [[ "$port" =~ ^[0-9]+$ ]] && trusted_candidates+=("$port")
-        done < <(
-            systemctl show ssh.socket --property=Listen --value 2>/dev/null |
-                awk '
-                    {
-                        for (i=1; i<=NF; i++) {
-                            if ($i == "(Stream)" && i > 1) print $(i-1)
-                        }
-                    }
-                '
-        )
-    fi
 
     while IFS= read -r port; do
         [[ "$port" =~ ^[0-9]+$ ]] && trusted_candidates+=("$port")
@@ -576,47 +555,182 @@ find_fail2ban_late_sshd_overrides() {
     done
 }
 
+wait_for_fail2ban_ready() {
+    local attempt
+    local ping_output=""
+    local ping_status=1
+    local service_state="unknown"
+
+    FAIL2BAN_VERIFY_FAILURE=""
+    for ((attempt=1; attempt<=15; attempt++)); do
+        ping_output=$(timeout 2 fail2ban-client ping 2>&1)
+        ping_status=$?
+        if (( ping_status == 0 )); then
+            detail "FAIL2BAN" "PING" "第 $attempt 次检查已就绪"
+            return 0
+        fi
+
+        service_state=$(systemctl is-failed fail2ban.service 2>/dev/null || true)
+        if [[ "$service_state" == "failed" ]]; then
+            FAIL2BAN_VERIFY_FAILURE="[FAIL2BAN][PING] 服务进入 failed；attempt=$attempt；exit=$ping_status；输出=${ping_output:-无}"
+            return 1
+        fi
+        detail "FAIL2BAN" "PING" "第 $attempt 次尚未就绪；exit=$ping_status；服务状态=$service_state；输出=${ping_output:-无}"
+        sleep 1
+    done
+
+    FAIL2BAN_VERIFY_FAILURE="[FAIL2BAN][PING] 15 秒内未就绪；最后退出码=$ping_status；输出=${ping_output:-无}"
+    return 1
+}
+
+restart_fail2ban_and_wait() {
+    local command_output=""
+    local command_status=0
+
+    command_output=$(systemctl restart fail2ban.service 2>&1)
+    command_status=$?
+    if (( command_status != 0 )); then
+        FAIL2BAN_VERIFY_FAILURE="[FAIL2BAN][RESTART] exit=$command_status；输出=${command_output:-无}"
+        detail "FAIL2BAN" "RESTART" "exit=$command_status；输出=${command_output:-无}"
+        return 1
+    fi
+    if ! wait_for_fail2ban_ready; then
+        detail "FAIL2BAN" "RESTART" "服务命令成功，但就绪等待失败：${FAIL2BAN_VERIFY_FAILURE:-未知}"
+        return 1
+    fi
+    detail "FAIL2BAN" "RESTART" "服务已重启并通过就绪等待"
+    return 0
+}
+
+fail2ban_runtime_port_matches() {
+    local expected_port="$1"
+    local actions_output=""
+    local properties_output=""
+    local actual_port=""
+    local action=""
+    local action_status=0
+    local found_port_property=0
+    local normalized_actual=""
+    local normalized_expected=""
+    local -a action_names=()
+
+    normalized_expected=$(tr -d '[:space:]' <<< "$expected_port")
+    actions_output=$(timeout 15 fail2ban-client get sshd actions 2>&1)
+    action_status=$?
+    if (( action_status != 0 )); then
+        FAIL2BAN_VERIFY_FAILURE="无法读取 sshd actions；exit=$action_status；输出=${actions_output:-无}"
+        return 1
+    fi
+
+    mapfile -t action_names < <(
+        printf '%s\n' "$actions_output" |
+            tr "[],'\"" ' ' |
+            awk '{for (i=1; i<=NF; i++) if ($i ~ /^[A-Za-z0-9_.@+-]+$/) print $i}' |
+            sort -u
+    )
+    if (( ${#action_names[@]} == 0 )); then
+        FAIL2BAN_VERIFY_FAILURE="sshd jail 未返回任何 action"
+        return 1
+    fi
+
+    for action in "${action_names[@]}"; do
+        properties_output=$(timeout 15 fail2ban-client get sshd actionproperties "$action" 2>&1)
+        action_status=$?
+        if (( action_status != 0 )); then
+            detail "FAIL2BAN" "PORT_VERIFY" "无法读取 action=$action 的属性；exit=$action_status；输出=${properties_output:-无}"
+            continue
+        fi
+        if ! tr "[],'\"" ' ' <<< "$properties_output" |
+             awk '{for (i=1; i<=NF; i++) print $i}' |
+             grep -Fxq port; then
+            continue
+        fi
+        found_port_property=1
+        actual_port=$(timeout 15 fail2ban-client get sshd action "$action" port 2>&1)
+        action_status=$?
+        if (( action_status != 0 )); then
+            FAIL2BAN_VERIFY_FAILURE="无法读取 sshd action=$action 的 port；exit=$action_status；输出=${actual_port:-无}"
+            return 1
+        fi
+        normalized_actual=$(tr -d '[:space:]' <<< "$actual_port")
+        if [[ "$normalized_actual" == "$normalized_expected" ]]; then
+            detail "FAIL2BAN" "PORT_VERIFY" "action=$action；端口=$normalized_actual"
+            return 0
+        fi
+    done
+
+    if [[ "$found_port_property" == "0" ]]; then
+        FAIL2BAN_VERIFY_FAILURE="sshd jail 的运行 action 未公开 port 属性，无法验证实际封禁端口"
+    else
+        FAIL2BAN_VERIFY_FAILURE="sshd jail 实际端口与期望不一致；期望=$normalized_expected；最后读取=${normalized_actual:-无}"
+    fi
+    return 1
+}
+
 verify_fail2ban_sshd_runtime() {
     local mode="$1"
     local expect_sshd_jail="${2:-1}"
-    local actual
+    local expected_port="${3:-}"
+    local actual=""
+    local command_output=""
+    local command_status=0
 
     FAIL2BAN_VERIFY_FAILURE=""
-    timeout 15 fail2ban-client ping >/dev/null 2>&1 || {
-        FAIL2BAN_VERIFY_FAILURE="fail2ban-client ping 失败"
+    if ! wait_for_fail2ban_ready; then
         return 1
-    }
-    [[ "$expect_sshd_jail" == "1" ]] || return 0
-    timeout 15 fail2ban-client status sshd >/dev/null 2>&1 || {
-        FAIL2BAN_VERIFY_FAILURE="sshd jail 未运行"
+    fi
+    if [[ "$expect_sshd_jail" != "1" ]]; then
+        return 0
+    fi
+
+    command_output=$(timeout 15 fail2ban-client status sshd 2>&1)
+    command_status=$?
+    if (( command_status != 0 )); then
+        FAIL2BAN_VERIFY_FAILURE="sshd jail 未运行；exit=$command_status；输出=${command_output:-无}"
         return 1
-    }
+    fi
+
     if [[ "$mode" == "full" ]]; then
-        actual=$(timeout 15 fail2ban-client get sshd maxretry 2>/dev/null) || {
-            FAIL2BAN_VERIFY_FAILURE="无法读取 sshd maxretry"
+        actual=$(timeout 15 fail2ban-client get sshd maxretry 2>&1)
+        command_status=$?
+        if (( command_status != 0 )); then
+            FAIL2BAN_VERIFY_FAILURE="无法读取 sshd maxretry；exit=$command_status；输出=${actual:-无}"
             return 1
-        }
-        [[ "$actual" == "5" ]] || {
+        fi
+        if [[ "$actual" != "5" ]]; then
             FAIL2BAN_VERIFY_FAILURE="sshd maxretry 期望=5 实际=$actual"
             return 1
-        }
-        actual=$(timeout 15 fail2ban-client get sshd findtime 2>/dev/null) || {
-            FAIL2BAN_VERIFY_FAILURE="无法读取 sshd findtime"
+        fi
+
+        actual=$(timeout 15 fail2ban-client get sshd findtime 2>&1)
+        command_status=$?
+        if (( command_status != 0 )); then
+            FAIL2BAN_VERIFY_FAILURE="无法读取 sshd findtime；exit=$command_status；输出=${actual:-无}"
             return 1
-        }
-        [[ "$actual" == "3600" ]] || {
+        fi
+        if [[ "$actual" != "3600" ]]; then
             FAIL2BAN_VERIFY_FAILURE="sshd findtime 期望=3600 实际=$actual"
             return 1
-        }
-        actual=$(timeout 15 fail2ban-client get sshd bantime 2>/dev/null) || {
-            FAIL2BAN_VERIFY_FAILURE="无法读取 sshd bantime"
+        fi
+
+        actual=$(timeout 15 fail2ban-client get sshd bantime 2>&1)
+        command_status=$?
+        if (( command_status != 0 )); then
+            FAIL2BAN_VERIFY_FAILURE="无法读取 sshd bantime；exit=$command_status；输出=${actual:-无}"
             return 1
-        }
-        [[ "$actual" == "86400" ]] || {
+        fi
+        if [[ "$actual" != "86400" ]]; then
             FAIL2BAN_VERIFY_FAILURE="sshd bantime 期望=86400 实际=$actual"
             return 1
-        }
+        fi
     fi
+
+    if [[ -n "$expected_port" ]]; then
+        if ! fail2ban_runtime_port_matches "$expected_port"; then
+            return 1
+        fi
+    fi
+    return 0
 }
 
 restore_fail2ban_transaction() {
@@ -640,10 +754,16 @@ restore_fail2ban_transaction() {
         cp -a -- "$legacy_backup" "$legacy_file" || failed=1
     fi
 
-    restore_unit_enablement fail2ban.service "$service_enabled" || failed=1
-    systemctl daemon-reload >/dev/null 2>&1 || failed=1
+    if ! restore_unit_enablement fail2ban.service "$service_enabled"; then
+        failed=1
+    fi
+    if ! systemctl daemon-reload >/dev/null 2>&1; then
+        failed=1
+    fi
     if [[ "$service_active" == "active" ]]; then
-        systemctl restart fail2ban >/dev/null 2>&1 || failed=1
+        if ! restart_fail2ban_and_wait; then
+            failed=1
+        fi
     else
         systemctl stop fail2ban >/dev/null 2>&1 || true
     fi
@@ -783,8 +903,12 @@ update_fail2ban_sshd_jail() {
         command_output=$(systemctl enable fail2ban 2>&1)
         command_status=$?
         if (( command_status == 0 )); then
-            command_output=$(systemctl restart fail2ban 2>&1)
-            command_status=$?
+            if restart_fail2ban_and_wait; then
+                command_status=0
+            else
+                command_output="${FAIL2BAN_VERIFY_FAILURE:-未知错误}"
+                command_status=1
+            fi
         fi
         if (( command_status != 0 )); then
             detail "FAIL2BAN" "START_SERVICE" "退出码=$command_status；输出=${command_output:-无}"
@@ -794,8 +918,12 @@ update_fail2ban_sshd_jail() {
             return 1
         fi
     elif [[ "$service_active" == "active" ]]; then
-        command_output=$(systemctl restart fail2ban 2>&1)
-        command_status=$?
+        if restart_fail2ban_and_wait; then
+            command_status=0
+        else
+            command_output="${FAIL2BAN_VERIFY_FAILURE:-未知错误}"
+            command_status=1
+        fi
         if (( command_status != 0 )); then
             detail "FAIL2BAN" "RESTART_SERVICE" "退出码=$command_status；输出=${command_output:-无}"
             rollback_fail2ban_with_message "$backup_path" "Fail2ban 重启失败" \
@@ -809,13 +937,14 @@ update_fail2ban_sshd_jail() {
           "$sshd_jail_active_before" == "1" ]]; then
         expect_sshd_jail=1
     fi
-    if [[ "$start_service" == "1" || "$service_active" == "active" ]] && \
-       ! verify_fail2ban_sshd_runtime "$mode" "$expect_sshd_jail"; then
-        detail "FAIL2BAN" "RUNTIME_VERIFY" "原因=${FAIL2BAN_VERIFY_FAILURE:-未知}；模式=$mode；要求 sshd jail=$expect_sshd_jail"
-        rollback_fail2ban_with_message "$backup_path" "Fail2ban 重启后 sshd jail 或生效参数验证失败" \
-            "$target_file" "$backup_file" "$file_existed" "$service_active" "$service_enabled" \
-            "$legacy_file" "$legacy_backup" "$legacy_existed"
-        return 1
+    if [[ "$start_service" == "1" || "$service_active" == "active" ]]; then
+        if ! verify_fail2ban_sshd_runtime "$mode" "$expect_sshd_jail" "$port"; then
+            detail "FAIL2BAN" "RUNTIME_VERIFY" "原因=${FAIL2BAN_VERIFY_FAILURE:-未知}；模式=$mode；要求 sshd jail=$expect_sshd_jail；期望端口=$port"
+            rollback_fail2ban_with_message "$backup_path" "Fail2ban 重启后 sshd jail 或生效参数验证失败" \
+                "$target_file" "$backup_file" "$file_existed" "$service_active" "$service_enabled" \
+                "$legacy_file" "$legacy_backup" "$legacy_existed"
+            return 1
+        fi
     fi
 
     detail "FAIL2BAN" "VERIFY" "配置=$target_file；端口=$port；模式=$mode；语法和运行状态验证通过；备份=$backup_path"
@@ -916,8 +1045,16 @@ scan_sysctl_configs() {
     local real_file
     local is_etc_file
     local name
+    local etc_root="${SYSCTL_SCAN_ROOT}/etc"
+    local sysctl_conf="${SYSCTL_SCAN_ROOT}/etc/sysctl.conf"
     local -A effective_by_name=()
-    local -a scan_dirs=(/etc/sysctl.d /run/sysctl.d /usr/local/lib/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d)
+    local -a scan_dirs=(
+        "${SYSCTL_SCAN_ROOT}/etc/sysctl.d"
+        "${SYSCTL_SCAN_ROOT}/run/sysctl.d"
+        "${SYSCTL_SCAN_ROOT}/usr/local/lib/sysctl.d"
+        "${SYSCTL_SCAN_ROOT}/usr/lib/sysctl.d"
+        "${SYSCTL_SCAN_ROOT}/lib/sysctl.d"
+    )
     local -a sorted_names=()
 
     EFFECTIVE_SYSCTL_FILES=()
@@ -941,8 +1078,8 @@ scan_sysctl_configs() {
             EFFECTIVE_SYSCTL_FILES+=("${effective_by_name[$name]}")
         done
     fi
-    if [[ -f /etc/sysctl.conf ]]; then
-        real_file=$(readlink -f /etc/sysctl.conf 2>/dev/null || printf '%s' /etc/sysctl.conf)
+    if [[ -f "$sysctl_conf" ]]; then
+        real_file=$(readlink -f "$sysctl_conf" 2>/dev/null || printf '%s' "$sysctl_conf")
         for file in "${EFFECTIVE_SYSCTL_FILES[@]}"; do
             if [[ "$(readlink -f "$file" 2>/dev/null || printf '%s' "$file")" == "$real_file" ]]; then
                 real_file=""
@@ -951,8 +1088,8 @@ scan_sysctl_configs() {
         done
         if [[ -n "$real_file" ]]; then
             LEGACY_SYSCTL_CONF_STANDALONE=1
-            if sysctl_file_has_scope /etc/sysctl.conf tcp; then
-                LEGACY_TCP_FILES+=(/etc/sysctl.conf)
+            if sysctl_file_has_scope "$sysctl_conf" tcp; then
+                LEGACY_TCP_FILES+=("$sysctl_conf")
             fi
         fi
     fi
@@ -960,7 +1097,7 @@ scan_sysctl_configs() {
     for file in "${EFFECTIVE_SYSCTL_FILES[@]}"; do
         real_file=$(readlink -f "$file" 2>/dev/null || printf '%s' "$file")
         is_etc_file=0
-        [[ "$file" == /etc/* && "$real_file" == /etc/* ]] && is_etc_file=1
+        [[ "$file" == "$etc_root"/* && "$real_file" == "$etc_root"/* ]] && is_etc_file=1
 
         if sysctl_file_has_scope "$file" bbr; then
             LAST_EFFECTIVE_KEY_FILE="$file"
@@ -1186,13 +1323,14 @@ get_effective_sysctl_value() {
 bbr_persistence_is_complete() {
     local effective_cc
     local effective_qdisc
+    local sysctl_conf="${SYSCTL_SCAN_ROOT}/etc/sysctl.conf"
 
     effective_cc=$(get_effective_sysctl_value net.ipv4.tcp_congestion_control)
     effective_qdisc=$(get_effective_sysctl_value net.core.default_qdisc)
     [[ "$effective_cc" == "bbr" && "$effective_qdisc" == "fq" ]] || return 1
 
-    if [[ -f /etc/sysctl.conf ]] && sysctl_file_has_scope /etc/sysctl.conf bbr; then
-        sysctl_file_keys_match_values /etc/sysctl.conf \
+    if [[ -f "$sysctl_conf" ]] && sysctl_file_has_scope "$sysctl_conf" bbr; then
+        sysctl_file_keys_match_values "$sysctl_conf" \
             net.ipv4.tcp_congestion_control bbr \
             net.core.default_qdisc fq || return 1
     fi
@@ -1446,19 +1584,36 @@ write_sysctl_keys_atomic() {
     local flexible_key
     local temp_file
 
-    (( $# > 0 && $# % 2 == 0 )) || return 1
-    [[ ! -L "$file" ]] || return 1
-    [[ ! -e "$file" || -f "$file" ]] || return 1
-    mkdir -p "$(dirname "$file")" || return 1
-    temp_file=$(mktemp "$(dirname "$file")/.vps-init-sysctl.XXXXXX") || return 1
+    if (( $# == 0 || $# % 2 != 0 )); then
+        return 1
+    fi
+    if [[ -L "$file" ]]; then
+        return 1
+    fi
+    if [[ -e "$file" && ! -f "$file" ]]; then
+        return 1
+    fi
+    if ! mkdir -p "$(dirname "$file")"; then
+        return 1
+    fi
+    temp_file=$(mktemp "$(dirname "$file")/.vps-init-sysctl.XXXXXX")
+    if [[ -z "$temp_file" ]]; then
+        return 1
+    fi
     if [[ -f "$file" ]]; then
         if ! cp -a -- "$file" "$temp_file"; then
             rm -f -- "$temp_file"
             return 1
         fi
-    elif ! chmod 644 "$temp_file" || ! chown root:root "$temp_file"; then
-        rm -f -- "$temp_file"
-        return 1
+    else
+        if ! chmod 644 "$temp_file"; then
+            rm -f -- "$temp_file"
+            return 1
+        fi
+        if ! chown root:root "$temp_file"; then
+            rm -f -- "$temp_file"
+            return 1
+        fi
     fi
 
     while (( $# > 0 )); do
@@ -1466,14 +1621,23 @@ write_sysctl_keys_atomic() {
         value="$2"
         shift 2
         flexible_key="${key//./[.\/]}"
-        if ! sed -i -E "\\|^[[:space:]]*-?[[:space:]]*${flexible_key}[[:space:]]*=|d" "$temp_file" || \
-           ! ensure_text_file_ends_with_newline "$temp_file" || \
-           ! printf '%s = %s\n' "$key" "$value" >> "$temp_file"; then
+        if ! sed -i -E "\\|^[[:space:]]*-?[[:space:]]*${flexible_key}[[:space:]]*=|d" "$temp_file"; then
+            rm -f -- "$temp_file"
+            return 1
+        fi
+        if ! ensure_text_file_ends_with_newline "$temp_file"; then
+            rm -f -- "$temp_file"
+            return 1
+        fi
+        if ! printf '%s = %s\n' "$key" "$value" >> "$temp_file"; then
             rm -f -- "$temp_file"
             return 1
         fi
     done
-    mv -f -- "$temp_file" "$file"
+    if ! mv -f -- "$temp_file" "$file"; then
+        rm -f -- "$temp_file"
+        return 1
+    fi
 }
 
 write_sysctl_key() {
@@ -1486,12 +1650,25 @@ remove_sysctl_key() {
     local flexible_key="${key//./[.\/]}"
     local temp_file
 
-    [[ -f "$file" ]] || return 0
-    [[ ! -L "$file" ]] || return 1
-    temp_file=$(mktemp "$(dirname "$file")/.vps-init-sysctl.XXXXXX") || return 1
-    if ! cp -a -- "$file" "$temp_file" || \
-       ! sed -i -E "\\|^[[:space:]]*-?[[:space:]]*${flexible_key}[[:space:]]*=|d" "$temp_file" || \
-       ! mv -f -- "$temp_file" "$file"; then
+    if [[ ! -f "$file" ]]; then
+        return 0
+    fi
+    if [[ -L "$file" ]]; then
+        return 1
+    fi
+    temp_file=$(mktemp "$(dirname "$file")/.vps-init-sysctl.XXXXXX")
+    if [[ -z "$temp_file" ]]; then
+        return 1
+    fi
+    if ! cp -a -- "$file" "$temp_file"; then
+        rm -f -- "$temp_file"
+        return 1
+    fi
+    if ! sed -i -E "\\|^[[:space:]]*-?[[:space:]]*${flexible_key}[[:space:]]*=|d" "$temp_file"; then
+        rm -f -- "$temp_file"
+        return 1
+    fi
+    if ! mv -f -- "$temp_file" "$file"; then
         rm -f -- "$temp_file"
         return 1
     fi
@@ -1507,16 +1684,26 @@ persist_bbr_settings() {
     local effective_cc
     local effective_qdisc
     local rollback_failed=0
+    local apply_failed=0
+    local command_output=""
+    local command_status=0
 
-    select_sysctl_target || return 1
-    validate_sysctl_conf_final_pass_for_bbr || return 1
+    if ! select_sysctl_target; then
+        return 1
+    fi
+    if ! validate_sysctl_conf_final_pass_for_bbr; then
+        return 1
+    fi
 
     [[ "$write_bbr" == "0" ]] && result_label="FQ"
     detail "BBR" "DETECT" "目标=$SYSCTL_TARGET；写入 BBR=$write_bbr；原拥塞控制=${previous_cc:-未知}；原队列=${previous_qdisc:-未知}"
 
-    if ! mkdir -p "$(dirname "$SYSCTL_TARGET")" || \
-       ! prepare_private_directory "$BACKUP_DIR"; then
-        error "无法创建 sysctl 配置或备份目录。"
+    if ! mkdir -p "$(dirname "$SYSCTL_TARGET")"; then
+        error "无法创建 sysctl 配置目录。"
+        return 1
+    fi
+    if ! prepare_private_directory "$BACKUP_DIR"; then
+        error "无法创建 sysctl 备份目录。"
         return 1
     fi
     if [[ -L "$SYSCTL_TARGET" ]] || [[ -e "$SYSCTL_TARGET" && ! -f "$SYSCTL_TARGET" ]]; then
@@ -1532,50 +1719,113 @@ persist_bbr_settings() {
     fi
 
     if command -v modprobe >/dev/null 2>&1; then
-        modprobe sch_fq >/dev/null 2>&1 || true
-        [[ "$write_bbr" == "0" ]] || modprobe tcp_bbr >/dev/null 2>&1 || true
+        if ! modprobe sch_fq >/dev/null 2>&1; then
+            detail "BBR" "MODULE" "sch_fq 无法显式加载；将继续依据 sysctl 实际能力验证"
+        fi
+        if [[ "$write_bbr" == "1" ]]; then
+            if ! modprobe tcp_bbr >/dev/null 2>&1; then
+                detail "BBR" "MODULE" "tcp_bbr 无法显式加载；将继续依据内核可用算法验证"
+            fi
+        fi
     fi
 
-    if [[ "$write_bbr" == "1" ]] && \
-       ! write_sysctl_keys_atomic "$SYSCTL_TARGET" \
-           net.core.default_qdisc fq \
-           net.ipv4.tcp_congestion_control bbr; then
-        error "写入 BBR 与 FQ 配置失败。"
-    elif [[ "$write_bbr" == "0" ]] && \
-         ! write_sysctl_keys_atomic "$SYSCTL_TARGET" net.core.default_qdisc fq; then
-        error "写入 FQ 配置失败。"
+    if [[ "$write_bbr" == "1" ]]; then
+        if ! write_sysctl_keys_atomic "$SYSCTL_TARGET" \
+            net.core.default_qdisc fq \
+            net.ipv4.tcp_congestion_control bbr; then
+            error "[BBR][APPLY] 写入 BBR 与 FQ 配置失败。"
+            apply_failed=1
+        fi
     else
+        if ! write_sysctl_keys_atomic "$SYSCTL_TARGET" net.core.default_qdisc fq; then
+            error "[BBR][APPLY] 写入 FQ 配置失败。"
+            apply_failed=1
+        fi
+    fi
+
+    if [[ "$apply_failed" == "0" ]]; then
         effective_qdisc=$(get_effective_sysctl_value net.core.default_qdisc)
         effective_cc=$(get_effective_sysctl_value net.ipv4.tcp_congestion_control)
-        if [[ "$effective_qdisc" != "fq" ]] || \
-           [[ "$write_bbr" == "1" && "$effective_cc" != "bbr" ]] || \
-           ! bbr_persistence_is_complete; then
-            error "配置文件加载顺序验证失败，重启后可能被其他 sysctl 文件覆盖。"
-        elif sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 && \
-             { [[ "$write_bbr" == "0" ]] || sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; } && \
-             [[ "$(sysctl -n net.core.default_qdisc 2>/dev/null)" == "fq" ]] && \
-             { [[ "$write_bbr" == "0" ]] || [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; }; then
-            action_success "$result_label" "运行状态和持久化顺序验证通过；配置：$SYSCTL_TARGET"
-            [[ -n "$backup_file" ]] && detail "BBR" "BACKUP" "原配置备份=$backup_file"
-            return 0
+        if [[ "$effective_qdisc" != "fq" ]]; then
+            error "[BBR][PERSIST_VERIFY] 最终持久化队列不是 fq，可能被更晚的 sysctl 配置覆盖。"
+            apply_failed=1
         fi
+        if [[ "$write_bbr" == "1" && "$effective_cc" != "bbr" ]]; then
+            error "[BBR][PERSIST_VERIFY] 最终持久化拥塞控制不是 bbr，可能被更晚的 sysctl 配置覆盖。"
+            apply_failed=1
+        fi
+        if [[ "$apply_failed" == "0" ]] && ! bbr_persistence_is_complete; then
+            error "[BBR][PERSIST_VERIFY] 配置加载顺序验证失败，重启后可能被覆盖。"
+            apply_failed=1
+        fi
+    fi
+
+    if [[ "$apply_failed" == "0" ]]; then
+        command_output=$(sysctl -w net.core.default_qdisc=fq 2>&1)
+        command_status=$?
+        if (( command_status != 0 )); then
+            detail "BBR" "APPLY_QDISC" "exit=$command_status；输出=${command_output:-无}"
+            error "[BBR][APPLY_QDISC] 无法应用 fq。"
+            apply_failed=1
+        fi
+    fi
+    if [[ "$apply_failed" == "0" && "$write_bbr" == "1" ]]; then
+        command_output=$(sysctl -w net.ipv4.tcp_congestion_control=bbr 2>&1)
+        command_status=$?
+        if (( command_status != 0 )); then
+            detail "BBR" "APPLY_BBR" "exit=$command_status；输出=${command_output:-无}"
+            error "[BBR][APPLY_BBR] 无法应用 bbr。"
+            apply_failed=1
+        fi
+    fi
+    if [[ "$apply_failed" == "0" ]]; then
+        if [[ "$(sysctl -n net.core.default_qdisc 2>/dev/null)" != "fq" ]]; then
+            error "[BBR][VERIFY] fq 运行值验证失败。"
+            apply_failed=1
+        fi
+    fi
+    if [[ "$apply_failed" == "0" && "$write_bbr" == "1" ]]; then
+        if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" != "bbr" ]]; then
+            error "[BBR][VERIFY] bbr 运行值验证失败。"
+            apply_failed=1
+        fi
+    fi
+    if [[ "$apply_failed" == "0" ]]; then
+        detail "BBR" "VERIFY" "运行状态和持久化最终值验证通过；目标=$SYSCTL_TARGET"
+        action_success "$result_label" "运行状态和持久化顺序验证通过；配置：$SYSCTL_TARGET"
+        if [[ -n "$backup_file" ]]; then
+            detail "BBR" "BACKUP" "原配置备份=$backup_file"
+        fi
+        return 0
     fi
 
     effective_qdisc=$(get_effective_sysctl_value net.core.default_qdisc)
     effective_cc=$(get_effective_sysctl_value net.ipv4.tcp_congestion_control)
     detail "BBR" "VERIFY" "目标=$SYSCTL_TARGET；期望队列=fq；期望拥塞控制=$([[ "$write_bbr" == "1" ]] && printf bbr || printf 保持不变)；持久化队列=${effective_qdisc:-未定义}；持久化拥塞控制=${effective_cc:-未定义}；运行队列=$(sysctl -n net.core.default_qdisc 2>/dev/null || printf 未知)；运行拥塞控制=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf 未知)"
     if [[ "$target_existed" == "1" ]]; then
-        cp -a "$backup_file" "$SYSCTL_TARGET" || rollback_failed=1
+        if ! cp -a -- "$backup_file" "$SYSCTL_TARGET"; then
+            rollback_failed=1
+        fi
     else
-        rm -f "$SYSCTL_TARGET" || rollback_failed=1
+        if ! rm -f -- "$SYSCTL_TARGET"; then
+            rollback_failed=1
+        fi
     fi
     if [[ -n "$previous_qdisc" ]]; then
-        sysctl -w "net.core.default_qdisc=$previous_qdisc" >/dev/null 2>&1 || rollback_failed=1
-        [[ "$(sysctl -n net.core.default_qdisc 2>/dev/null)" == "$previous_qdisc" ]] || rollback_failed=1
+        if ! sysctl -w "net.core.default_qdisc=$previous_qdisc" >/dev/null 2>&1; then
+            rollback_failed=1
+        fi
+        if [[ "$(sysctl -n net.core.default_qdisc 2>/dev/null)" != "$previous_qdisc" ]]; then
+            rollback_failed=1
+        fi
     fi
     if [[ -n "$previous_cc" ]]; then
-        sysctl -w "net.ipv4.tcp_congestion_control=$previous_cc" >/dev/null 2>&1 || rollback_failed=1
-        [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "$previous_cc" ]] || rollback_failed=1
+        if ! sysctl -w "net.ipv4.tcp_congestion_control=$previous_cc" >/dev/null 2>&1; then
+            rollback_failed=1
+        fi
+        if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" != "$previous_cc" ]]; then
+            rollback_failed=1
+        fi
     fi
     if [[ "$rollback_failed" == "0" ]]; then
         detail "BBR" "ROLLBACK" "配置文件和运行参数恢复成功；目标=$SYSCTL_TARGET"
@@ -1600,14 +1850,13 @@ OS_VERSION=""
 OS_CODENAME=""
 OS_ARCH=""
 OS_MAINTENANCE_CODE="unknown"
-UBUNTU_PRO_ESM_STATUS_REASON=""
 
 os_version_is_supported() {
     local os_id="$1"
     local os_version="$2"
 
     case "$os_id:$os_version" in
-        debian:12|debian:13|ubuntu:20.04|ubuntu:22.04|ubuntu:24.04) return 0 ;;
+        debian:12|debian:13) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -1618,90 +1867,9 @@ os_codename_matches_version() {
     local os_codename="$3"
 
     case "$os_id:$os_version:$os_codename" in
-        debian:12:bookworm|debian:13:trixie|\
-        ubuntu:20.04:focal|ubuntu:22.04:jammy|ubuntu:24.04:noble) return 0 ;;
+        debian:12:bookworm|debian:13:trixie) return 0 ;;
         *) return 1 ;;
     esac
-}
-
-ubuntu_pro_json_result_is_usable() {
-    local json="$1"
-
-    # Newer Pro clients wrap API attributes with a result field, while older
-    # documented clients may print the attributes directly. If a result field
-    # exists, only an explicit success response is accepted.
-    if grep -Eq '"result"[[:space:]]*:' <<< "$json"; then
-        grep -Eq '"result"[[:space:]]*:[[:space:]]*"success"' <<< "$json"
-    else
-        return 0
-    fi
-}
-
-ubuntu_pro_attachment_json_is_valid() {
-    local json="$1"
-
-    ubuntu_pro_json_result_is_usable "$json" &&
-        grep -Eq '"is_attached_and_contract_valid"[[:space:]]*:[[:space:]]*true([[:space:],}])' <<< "$json"
-}
-
-ubuntu_pro_enabled_services_json_has_esm_infra() {
-    local json="$1"
-
-    ubuntu_pro_enabled_services_json_has_service "$json" esm-infra
-}
-
-ubuntu_pro_enabled_services_json_has_service() {
-    local json="$1"
-    local service="$2"
-    local pattern
-
-    [[ "$service" =~ ^[a-z0-9-]+$ ]] || return 1
-    pattern="\"name\"[[:space:]]*:[[:space:]]*\"${service}\""
-    ubuntu_pro_json_result_is_usable "$json" &&
-        grep -Eq "$pattern" <<< "$json"
-}
-
-ubuntu_pro_service_is_active() {
-    local service="$1"
-    local attachment_json=""
-    local services_json=""
-
-    [[ "$service" =~ ^[a-z0-9-]+$ ]] || return 1
-    UBUNTU_PRO_ESM_STATUS_REASON=""
-    if ! command -v pro >/dev/null 2>&1; then
-        UBUNTU_PRO_ESM_STATUS_REASON="未找到 Ubuntu Pro 客户端（pro）"
-        return 1
-    fi
-    if ! command -v timeout >/dev/null 2>&1; then
-        UBUNTU_PRO_ESM_STATUS_REASON="缺少用于限制状态检查时长的 timeout 命令"
-        return 1
-    fi
-    if ! attachment_json=$(LC_ALL=C timeout 15 pro api \
-            u.pro.status.is_attached.v1 2>/dev/null); then
-        UBUNTU_PRO_ESM_STATUS_REASON="Pro 客户端无法执行合同状态 API（请更新 ubuntu-advantage-tools）"
-        return 1
-    fi
-    if ! ubuntu_pro_attachment_json_is_valid "$attachment_json"; then
-        UBUNTU_PRO_ESM_STATUS_REASON="Ubuntu Pro 未绑定，或当前合同已经失效"
-        return 1
-    fi
-    if ! services_json=$(LC_ALL=C timeout 15 pro api \
-            u.pro.status.enabled_services.v1 2>/dev/null); then
-        UBUNTU_PRO_ESM_STATUS_REASON="Pro 客户端无法读取已启用服务"
-        return 1
-    fi
-    if ! ubuntu_pro_enabled_services_json_has_service "$services_json" "$service"; then
-        UBUNTU_PRO_ESM_STATUS_REASON="$service 未启用"
-        return 1
-    fi
-}
-
-ubuntu_pro_esm_infra_is_active() {
-    ubuntu_pro_service_is_active esm-infra
-}
-
-ubuntu_pro_esm_apps_is_active() {
-    ubuntu_pro_service_is_active esm-apps
 }
 
 os_arch_is_supported() {
@@ -1709,21 +1877,9 @@ os_arch_is_supported() {
     local os_version="$2"
     local architecture="$3"
 
-    case "$os_id:$os_version" in
-        debian:12)
-            case "$architecture" in
-                amd64|arm64|armel|armhf|i386|mips64el|mipsel|ppc64el|s390x) return 0 ;;
-            esac
-            ;;
-        debian:13)
-            case "$architecture" in
-                amd64|arm64|armhf|ppc64el|riscv64|s390x) return 0 ;;
-            esac
-            ;;
-        ubuntu:20.04|ubuntu:22.04|ubuntu:24.04)
-            case "$architecture" in
-                amd64|arm64|armhf|ppc64el|riscv64|s390x) return 0 ;;
-            esac
+    case "$os_id:$os_version:$architecture" in
+        debian:12:amd64|debian:12:arm64|debian:13:amd64|debian:13:arm64)
+            return 0
             ;;
     esac
     return 1
@@ -1746,28 +1902,6 @@ debian_lts_arch_is_supported() {
 
 debian_lts_arch_data_is_available() {
     [[ "$1" == "12" ]]
-}
-
-ubuntu_extended_maintenance_arch_is_supported() {
-    local version="$1"
-    local architecture="$2"
-
-    case "$version" in
-        20.04)
-            case "$architecture" in
-                amd64|arm64|ppc64el|riscv64|s390x) return 0 ;;
-                *) return 1 ;;
-            esac
-            ;;
-        *) return 1 ;;
-    esac
-}
-
-ubuntu_extended_maintenance_arch_data_is_available() {
-    local version="$1"
-    local phase="$2"
-
-    [[ "$version" == "20.04" && "$phase" == "esm" ]]
 }
 
 report_debian_lts_package_support() {
@@ -1836,39 +1970,6 @@ get_os_maintenance_code() {
                 printf eol
             fi
             ;;
-        ubuntu:20.04)
-            if (( 10#$today <= 20250531 )); then
-                printf standard
-            elif (( 10#$today <= 20300531 )); then
-                printf esm
-            elif (( 10#$today <= 20350531 )); then
-                printf legacy
-            else
-                printf eol
-            fi
-            ;;
-        ubuntu:22.04)
-            if (( 10#$today <= 20270531 )); then
-                printf standard
-            elif (( 10#$today <= 20320531 )); then
-                printf esm
-            elif (( 10#$today <= 20370531 )); then
-                printf legacy
-            else
-                printf eol
-            fi
-            ;;
-        ubuntu:24.04)
-            if (( 10#$today <= 20290531 )); then
-                printf standard
-            elif (( 10#$today <= 20340531 )); then
-                printf esm
-            elif (( 10#$today <= 20390531 )); then
-                printf legacy
-            else
-                printf eol
-            fi
-            ;;
         *) printf unknown ;;
     esac
 }
@@ -1877,8 +1978,6 @@ format_os_maintenance_status() {
     case "${1:-$OS_MAINTENANCE_CODE}" in
         standard) printf '标准维护期' ;;
         lts) printf 'Debian LTS 维护期' ;;
-        esm) printf 'Ubuntu Pro / ESM 维护期' ;;
-        legacy) printf 'Ubuntu Pro Legacy 支持期' ;;
         eol) printf '维护已结束' ;;
         *) printf '未知' ;;
     esac
@@ -1896,12 +1995,12 @@ check_os() {
 
     if ! os_version_is_supported "$OS_ID" "$OS_VERSION"; then
         error "当前系统 $OS_ID ${OS_VERSION:-未知版本} 不在已验证范围内。"
-        echo "仅支持 Debian 12/13 与 Ubuntu 20.04/22.04/24.04。"
+        echo "仅支持 Debian 12 Bookworm 与 Debian 13 Trixie。"
         exit 1
     fi
     if ! os_codename_matches_version "$OS_ID" "$OS_VERSION" "$OS_CODENAME"; then
         error "系统版本与代号不一致：$OS_ID ${OS_VERSION:-未知版本} / ${OS_CODENAME:-未知代号}。"
-        echo "脚本仅接受官方对应关系：Debian 12/bookworm、13/trixie；Ubuntu 20.04/focal、22.04/jammy、24.04/noble。"
+        echo "脚本仅接受官方对应关系：Debian 12/bookworm、Debian 13/trixie。"
         exit 1
     fi
     if [[ ! -d /run/systemd/system ]]; then
@@ -1928,35 +2027,6 @@ check_os() {
             fi
             warn "$OS_ID $OS_VERSION 已进入 Debian LTS 阶段，请确认所用架构和软件包仍在 LTS 覆盖范围内。"
             report_debian_lts_package_support
-            ;;
-        esm)
-            if [[ "$OS_ID" == "ubuntu" ]] && \
-               ! ubuntu_extended_maintenance_arch_data_is_available "$OS_VERSION" esm; then
-                error "Ubuntu $OS_VERSION 已进入 ESM，但当前脚本没有该阶段已发布的架构覆盖数据；请先更新脚本。"
-                exit 1
-            elif [[ "$OS_ID" == "ubuntu" ]] && \
-                 ! ubuntu_extended_maintenance_arch_is_supported "$OS_VERSION" "$OS_ARCH"; then
-                error "Ubuntu $OS_VERSION 已进入 ESM，但架构 ${OS_ARCH:-未知} 不在该版本的官方 ESM 覆盖范围内，脚本已停止。"
-                exit 1
-            fi
-            if ! ubuntu_pro_esm_infra_is_active; then
-                error "Ubuntu $OS_VERSION 已结束标准安全维护，但无法确认有效的 ESM Infra：${UBUNTU_PRO_ESM_STATUS_REASON:-状态未知}。"
-                echo "请先更新 ubuntu-advantage-tools，并使用 'pro status --all' 确认 esm-infra 为 enabled；脚本不会自动绑定订阅或启用服务。"
-                exit 1
-            fi
-            warn "$OS_ID $OS_VERSION 已进入 ESM 阶段；已确认 Ubuntu Pro 合同有效且 esm-infra 已启用。"
-            ;;
-        legacy)
-            if [[ "$OS_ID" == "ubuntu" ]] && \
-               ! ubuntu_extended_maintenance_arch_data_is_available "$OS_VERSION" legacy; then
-                error "Ubuntu $OS_VERSION 已进入 Legacy 支持期，但当前脚本没有该阶段已发布的架构覆盖数据；请先更新脚本。"
-                exit 1
-            elif [[ "$OS_ID" == "ubuntu" ]] && \
-                 ! ubuntu_extended_maintenance_arch_is_supported "$OS_VERSION" "$OS_ARCH"; then
-                error "Ubuntu $OS_VERSION 的架构 ${OS_ARCH:-未知} 不在该版本公开列出的 Legacy 覆盖范围内，脚本已停止。"
-                exit 1
-            fi
-            warn "$OS_ID $OS_VERSION 已结束 ESM，仅在订阅 Ubuntu Pro Legacy 支持附加服务时仍受维护；建议尽快升级系统。"
             ;;
         eol)
             error "$OS_ID $OS_VERSION 的维护周期已经结束，为避免在无安全更新的系统上继续操作，脚本已停止。"
@@ -1988,33 +2058,65 @@ check_dependencies() {
 }
 
 acquire_instance_lock() {
-    local lock_file="/run/lock/vps-init.lock"
+    local recorded_pid=""
 
     require_commands "单实例保护" flock || exit 1
-    mkdir -p "$(dirname "$lock_file")" || {
+    mkdir -p "$(dirname "$INSTANCE_LOCK_FILE")" || {
         error "无法创建运行锁目录，已停止操作。"
         exit 1
     }
-    if [[ -L "$lock_file" ]] || [[ -e "$lock_file" && ! -f "$lock_file" ]]; then
-        error "运行锁 $lock_file 不是普通文件，已停止操作。"
+    if [[ -L "$INSTANCE_LOCK_FILE" ]] || [[ -e "$INSTANCE_LOCK_FILE" && ! -f "$INSTANCE_LOCK_FILE" ]]; then
+        error "运行锁 $INSTANCE_LOCK_FILE 不是普通文件，已停止操作。"
         exit 1
     fi
-    exec 9>>"$lock_file" || {
-        error "无法打开运行锁 $lock_file，已停止操作。"
+    exec 9>>"$INSTANCE_LOCK_FILE" || {
+        error "无法打开运行锁 $INSTANCE_LOCK_FILE，已停止操作。"
         exit 1
     }
-    chmod 600 "$lock_file" 2>/dev/null || {
+    chmod 600 "$INSTANCE_LOCK_FILE" 2>/dev/null || {
         error "无法设置运行锁权限，已停止操作。"
         exit 1
     }
     if ! flock -n 9; then
-        error "检测到另一个 vps-init 实例正在运行；为避免并发修改系统配置，本次已退出。"
+        recorded_pid=$(tail -n 1 "$INSTANCE_LOCK_FILE" 2>/dev/null || true)
+        if [[ "$recorded_pid" =~ ^[0-9]+$ ]] && kill -0 "$recorded_pid" 2>/dev/null; then
+            error "检测到另一个 vps-init 实例正在运行（PID=$recorded_pid）；本次已退出。"
+        else
+            error "运行锁正被其他进程持有，但无法确认其 PID；本次已退出。"
+        fi
+        exit 1
+    fi
+    INSTANCE_LOCK_HELD=1
+    if ! : > "$INSTANCE_LOCK_FILE"; then
+        error "无法记录运行锁所有者，已停止操作。"
+        exit 1
+    fi
+    if ! printf '%s\n' "$$" >&9; then
+        error "无法写入运行锁 PID，已停止操作。"
         exit 1
     fi
 }
 
+release_instance_lock() {
+    if [[ "$INSTANCE_LOCK_HELD" != "1" ]]; then
+        return 0
+    fi
+    : > "$INSTANCE_LOCK_FILE" 2>/dev/null || true
+    flock -u 9 2>/dev/null || true
+    exec 9>&-
+    INSTANCE_LOCK_HELD=0
+}
+
+handle_termination_signal() {
+    local signal_name="$1"
+    local exit_code="$2"
+
+    warn "收到 $signal_name，正在安全退出。"
+    exit "$exit_code"
+}
+
 # ==========================================
-# 辅助函数：安全重启 SSH 服务（兼容 Ubuntu 24.04+）
+# 辅助函数：Debian ssh.service 事务与安全重启
 # ==========================================
 ssh_unit_exists() {
     systemctl cat "$1" >/dev/null 2>&1
@@ -2036,27 +2138,24 @@ unit_transaction_state_is_supported() {
 begin_ssh_transaction() {
     SSH_BACKUP_PATH="$BACKUP_DIR/ssh-$(date +%Y%m%d%H%M%S)-$$"
     SSH_MANAGED_EXISTED=0
-    SSH_SOCKET_ENABLED=$(systemctl is-enabled ssh.socket 2>/dev/null || true)
-    SSH_SOCKET_ACTIVE=$(systemctl is-active ssh.socket 2>/dev/null || true)
     SSH_SERVICE_ENABLED=$(systemctl is-enabled ssh.service 2>/dev/null || true)
     SSH_SERVICE_ACTIVE=$(systemctl is-active ssh.service 2>/dev/null || true)
-    SSH_SOCKET_SERVICE_DROPIN_EXISTED=0
-    SSH_SOCKET_ADDRESS_DROPIN_EXISTED=0
-    SSH_SOCKET_GENERATOR_MASK_EXISTED=0
 
-    if ssh_unit_exists ssh.service && \
-       ! unit_transaction_state_is_supported "$SSH_SERVICE_ENABLED" "$SSH_SERVICE_ACTIVE"; then
+    if ! ssh_unit_exists ssh.service; then
+        error "未找到 Debian ssh.service，已停止操作。"
+        return 1
+    fi
+    if ! unit_transaction_state_is_supported "$SSH_SERVICE_ENABLED" "$SSH_SERVICE_ACTIVE"; then
         error "ssh.service 的 systemd 状态无法安全事务化（启用=$SSH_SERVICE_ENABLED，运行=$SSH_SERVICE_ACTIVE），已停止操作。"
         return 1
     fi
-    if ssh_unit_exists ssh.socket && \
-       ! unit_transaction_state_is_supported "$SSH_SOCKET_ENABLED" "$SSH_SOCKET_ACTIVE"; then
-        error "ssh.socket 的 systemd 状态无法安全事务化（启用=$SSH_SOCKET_ENABLED，运行=$SSH_SOCKET_ACTIVE），已停止操作。"
+    if [[ "$SSH_SERVICE_ACTIVE" != "active" ]]; then
+        error "ssh.service 当前不是 active，脚本不会在未知 SSH 运行方式下修改配置。"
         return 1
     fi
 
-    if [[ ! -f /etc/ssh/sshd_config || -L /etc/ssh/sshd_config ]]; then
-        error "/etc/ssh/sshd_config 不是可安全替换的普通文件，已停止操作。"
+    if [[ ! -f "$SSHD_CONFIG_FILE" || -L "$SSHD_CONFIG_FILE" ]]; then
+        error "$SSHD_CONFIG_FILE 不是可安全替换的普通文件，已停止操作。"
         return 1
     fi
     if [[ -L "$SSH_MANAGED_FILE" ]] || \
@@ -2064,53 +2163,25 @@ begin_ssh_transaction() {
         error "$SSH_MANAGED_FILE 不是可安全替换的普通文件，已停止操作。"
         return 1
     fi
-    prepare_backup_path "$SSH_BACKUP_PATH" || return 1
-    mkdir -p "$(dirname "$SSH_MANAGED_FILE")" || return 1
-    cp -a /etc/ssh/sshd_config "$SSH_BACKUP_PATH/sshd_config" || return 1
-    if [[ -e "$SSH_MANAGED_FILE" || -L "$SSH_MANAGED_FILE" ]]; then
-        SSH_MANAGED_EXISTED=1
-        cp -a "$SSH_MANAGED_FILE" "$SSH_BACKUP_PATH/managed.conf" || return 1
-    fi
-    if [[ -e "$SSH_SOCKET_SERVICE_DROPIN" || -L "$SSH_SOCKET_SERVICE_DROPIN" ]]; then
-        if [[ ! -f "$SSH_SOCKET_SERVICE_DROPIN" && ! -L "$SSH_SOCKET_SERVICE_DROPIN" ]]; then
-            error "$SSH_SOCKET_SERVICE_DROPIN 不是普通文件或符号链接，已停止操作。"
-            return 1
-        fi
-        SSH_SOCKET_SERVICE_DROPIN_EXISTED=1
-        cp -a "$SSH_SOCKET_SERVICE_DROPIN" "$SSH_BACKUP_PATH/00-socket.conf" || return 1
-    fi
-    if [[ -e "$SSH_SOCKET_ADDRESS_DROPIN" || -L "$SSH_SOCKET_ADDRESS_DROPIN" ]]; then
-        if [[ ! -f "$SSH_SOCKET_ADDRESS_DROPIN" && ! -L "$SSH_SOCKET_ADDRESS_DROPIN" ]]; then
-            error "$SSH_SOCKET_ADDRESS_DROPIN 不是普通文件或符号链接，已停止操作。"
-            return 1
-        fi
-        SSH_SOCKET_ADDRESS_DROPIN_EXISTED=1
-        cp -a "$SSH_SOCKET_ADDRESS_DROPIN" "$SSH_BACKUP_PATH/addresses.conf" || return 1
-    fi
-    if [[ -e "$SSH_SOCKET_GENERATOR_MASK" || -L "$SSH_SOCKET_GENERATOR_MASK" ]]; then
-        if [[ ! -f "$SSH_SOCKET_GENERATOR_MASK" && ! -L "$SSH_SOCKET_GENERATOR_MASK" ]]; then
-            error "$SSH_SOCKET_GENERATOR_MASK 不是普通文件或符号链接，已停止操作。"
-            return 1
-        fi
-        SSH_SOCKET_GENERATOR_MASK_EXISTED=1
-        cp -a "$SSH_SOCKET_GENERATOR_MASK" "$SSH_BACKUP_PATH/sshd-socket-generator" || return 1
-    fi
-    detail "SSH" "BACKUP" "备份=$SSH_BACKUP_PATH；托管文件原先存在=$SSH_MANAGED_EXISTED；generator 屏蔽原先存在=$SSH_SOCKET_GENERATOR_MASK_EXISTED；ssh.service 启用=$SSH_SERVICE_ENABLED/运行=$SSH_SERVICE_ACTIVE；ssh.socket 启用=$SSH_SOCKET_ENABLED/运行=$SSH_SOCKET_ACTIVE"
-}
-
-restore_ssh_dropin() {
-    local target="$1"
-    local backup="$2"
-    local existed="$3"
-
-    if [[ -d "$target" && ! -L "$target" ]]; then
+    if ! prepare_backup_path "$SSH_BACKUP_PATH"; then
         return 1
     fi
-    rm -f -- "$target" || return 1
-    if [[ "$existed" == "1" ]]; then
-        mkdir -p "$(dirname "$target")" || return 1
-        cp -a -- "$backup" "$target" || return 1
+    if ! mkdir -p "$(dirname "$SSH_MANAGED_FILE")"; then
+        error "无法创建 SSH drop-in 目录。"
+        return 1
     fi
+    if ! cp -a -- "$SSHD_CONFIG_FILE" "$SSH_BACKUP_PATH/sshd_config"; then
+        error "无法备份 $SSHD_CONFIG_FILE。"
+        return 1
+    fi
+    if [[ -e "$SSH_MANAGED_FILE" || -L "$SSH_MANAGED_FILE" ]]; then
+        SSH_MANAGED_EXISTED=1
+        if ! cp -a -- "$SSH_MANAGED_FILE" "$SSH_BACKUP_PATH/managed.conf"; then
+            error "无法备份 $SSH_MANAGED_FILE。"
+            return 1
+        fi
+    fi
+    detail "SSH" "BACKUP" "备份=$SSH_BACKUP_PATH；托管文件原先存在=$SSH_MANAGED_EXISTED；ssh.service 启用=$SSH_SERVICE_ENABLED/运行=$SSH_SERVICE_ACTIVE"
 }
 
 restore_unit_enablement() {
@@ -2150,33 +2221,38 @@ restore_unit_enablement() {
 
 restore_ssh_transaction() {
     local failed=0
+    local restored_ports=""
 
-    cp -a "$SSH_BACKUP_PATH/sshd_config" /etc/ssh/sshd_config || failed=1
+    if ! cp -a -- "$SSH_BACKUP_PATH/sshd_config" "$SSHD_CONFIG_FILE"; then
+        failed=1
+    fi
     if [[ "$SSH_MANAGED_EXISTED" == "1" ]]; then
-        cp -a "$SSH_BACKUP_PATH/managed.conf" "$SSH_MANAGED_FILE" || failed=1
+        if ! cp -a -- "$SSH_BACKUP_PATH/managed.conf" "$SSH_MANAGED_FILE"; then
+            failed=1
+        fi
     else
-        rm -f "$SSH_MANAGED_FILE" || failed=1
+        if ! rm -f -- "$SSH_MANAGED_FILE"; then
+            failed=1
+        fi
     fi
-    restore_ssh_dropin "$SSH_SOCKET_SERVICE_DROPIN" \
-        "$SSH_BACKUP_PATH/00-socket.conf" "$SSH_SOCKET_SERVICE_DROPIN_EXISTED" || failed=1
-    restore_ssh_dropin "$SSH_SOCKET_ADDRESS_DROPIN" \
-        "$SSH_BACKUP_PATH/addresses.conf" "$SSH_SOCKET_ADDRESS_DROPIN_EXISTED" || failed=1
-    restore_ssh_dropin "$SSH_SOCKET_GENERATOR_MASK" \
-        "$SSH_BACKUP_PATH/sshd-socket-generator" "$SSH_SOCKET_GENERATOR_MASK_EXISTED" || failed=1
-
-    systemctl stop ssh.service >/dev/null 2>&1 || true
-    systemctl stop ssh.socket >/dev/null 2>&1 || true
-    restore_unit_enablement ssh.service "$SSH_SERVICE_ENABLED" || failed=1
-    restore_unit_enablement ssh.socket "$SSH_SOCKET_ENABLED" || failed=1
-    systemctl daemon-reload >/dev/null 2>&1 || failed=1
-
-    if [[ "$SSH_SOCKET_ACTIVE" == "active" ]] && ssh_unit_exists ssh.socket; then
-        systemctl start ssh.socket >/dev/null 2>&1 || failed=1
+    if ! restore_unit_enablement ssh.service "$SSH_SERVICE_ENABLED"; then
+        failed=1
     fi
+    if ! systemctl daemon-reload >/dev/null 2>&1; then
+        failed=1
+    fi
+
     if [[ "$SSH_SERVICE_ACTIVE" == "active" ]]; then
-        systemctl start ssh.service >/dev/null 2>&1 || \
-            systemctl start ssh >/dev/null 2>&1 || \
-            systemctl start sshd >/dev/null 2>&1 || failed=1
+        restored_ports=$(get_configured_ssh_ports)
+        if [[ -z "$restored_ports" ]]; then
+            failed=1
+        elif ! restart_ssh "$restored_ports"; then
+            failed=1
+        fi
+    else
+        if ! systemctl stop ssh.service >/dev/null 2>&1; then
+            failed=1
+        fi
     fi
     return "$failed"
 }
@@ -2188,11 +2264,11 @@ rollback_ssh_with_message() {
 
     configured_port=$(get_configured_ssh_ports)
     listening_ports=$(get_listening_ssh_ports)
-    detail "SSH" "ROLLBACK" "触发原因=$message；配置端口=${configured_port:-未知}；监听端口=${listening_ports:-未检测到}；ssh.service=$(systemctl is-active ssh.service 2>/dev/null || printf 未知)；ssh.socket=$(systemctl is-active ssh.socket 2>/dev/null || printf 未知)；备份=$SSH_BACKUP_PATH"
+    detail "SSH" "ROLLBACK" "触发原因=$message；配置端口=${configured_port:-未知}；监听端口=${listening_ports:-未检测到}；ssh.service=$(systemctl is-active ssh.service 2>/dev/null || printf 未知)；备份=$SSH_BACKUP_PATH"
 
     if restore_ssh_transaction; then
-        detail "SSH" "ROLLBACK" "SSH 配置及 service/socket 状态恢复成功"
-        error "$message，SSH 配置与 socket/service 状态已回滚。"
+        detail "SSH" "ROLLBACK" "SSH 配置及 ssh.service 状态恢复成功"
+        error "$message，SSH 配置与 ssh.service 状态已回滚。"
     else
         detail "SSH" "ROLLBACK" "SSH 自动恢复不完整；备份=$SSH_BACKUP_PATH"
         error "$message，自动回滚未完全成功，请从 $SSH_BACKUP_PATH 手动恢复。"
@@ -2203,24 +2279,24 @@ ensure_ssh_managed_include() {
     local temp_file
 
     mkdir -p "$(dirname "$SSH_MANAGED_FILE")" || return 1
-    if ! grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf([[:space:]]|$)' /etc/ssh/sshd_config; then
-        temp_file=$(mktemp /etc/ssh/.vps-init-sshd.XXXXXX) || return 1
+    if ! grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf([[:space:]]|$)' "$SSHD_CONFIG_FILE"; then
+        temp_file=$(mktemp "$(dirname "$SSHD_CONFIG_FILE")/.vps-init-sshd.XXXXXX") || return 1
         {
             echo "Include /etc/ssh/sshd_config.d/*.conf"
-            cat /etc/ssh/sshd_config
+            cat "$SSHD_CONFIG_FILE"
         } > "$temp_file" || {
             rm -f "$temp_file"
             return 1
         }
-        chmod --reference=/etc/ssh/sshd_config "$temp_file" || {
+        chmod --reference="$SSHD_CONFIG_FILE" "$temp_file" || {
             rm -f "$temp_file"
             return 1
         }
-        chown --reference=/etc/ssh/sshd_config "$temp_file" || {
+        chown --reference="$SSHD_CONFIG_FILE" "$temp_file" || {
             rm -f "$temp_file"
             return 1
         }
-        mv -f "$temp_file" /etc/ssh/sshd_config || return 1
+        mv -f "$temp_file" "$SSHD_CONFIG_FILE" || return 1
     fi
     touch "$SSH_MANAGED_FILE" || return 1
     chmod 600 "$SSH_MANAGED_FILE" || return 1
@@ -2346,106 +2422,79 @@ root_key_only_login_is_safe() {
     esac
 }
 
-ssh_uses_ubuntu_socket_generator() {
-    local ubuntu_major="${OS_VERSION%%.*}"
-
-    [[ "$OS_ID" == "ubuntu" && "$ubuntu_major" =~ ^[0-9]+$ && "$ubuntu_major" -ge 24 ]]
-}
-
-switch_ssh_to_service() {
-    local mask_generator="${1:-0}"
-    local generator_target=""
-
-    if [[ "$mask_generator" == "1" ]]; then
-        if [[ -e "$SSH_SOCKET_GENERATOR_MASK" || -L "$SSH_SOCKET_GENERATOR_MASK" ]]; then
-            if [[ ! -L "$SSH_SOCKET_GENERATOR_MASK" ]]; then
-                error "$SSH_SOCKET_GENERATOR_MASK 已存在且不是官方 /dev/null 屏蔽链接，无法安全切换 SSH 模式。"
-                return 1
-            fi
-            generator_target=$(readlink -f "$SSH_SOCKET_GENERATOR_MASK" 2>/dev/null || true)
-            if [[ "$generator_target" != "/dev/null" ]]; then
-                error "$SSH_SOCKET_GENERATOR_MASK 指向未知目标，无法安全切换 SSH 模式。"
-                return 1
-            fi
-        else
-            mkdir -p "$(dirname "$SSH_SOCKET_GENERATOR_MASK")" || return 1
-            ln -s /dev/null "$SSH_SOCKET_GENERATOR_MASK" || return 1
-        fi
-        rm -f -- "$SSH_SOCKET_SERVICE_DROPIN" "$SSH_SOCKET_ADDRESS_DROPIN" || return 1
-    fi
-    systemctl daemon-reload >/dev/null 2>&1 || return 1
-    if ssh_unit_exists ssh.socket; then
-        systemctl disable --now ssh.socket >/dev/null 2>&1 || return 1
-    fi
-    systemctl unmask ssh.service >/dev/null 2>&1 || return 1
-    systemctl enable ssh.service >/dev/null 2>&1 || return 1
-    systemctl restart ssh.service >/dev/null 2>&1
-}
-
 restart_ssh() {
     local expected_port="${1:-}"
-    local expected_ports
-    local listening_ports
-    local mask_generator=0
-    local socket_state
-    local socket_enabled
+    local expected_ports=""
+    local listening_ports=""
+    local command_output=""
+    local command_status=0
+    local attempt=0
 
     expected_ports="$expected_port"
     [[ -n "$expected_ports" ]] || expected_ports=$(get_configured_ssh_ports)
-    [[ -n "$expected_ports" ]] || return 1
-    systemctl daemon-reload >/dev/null 2>&1 || return 1
-    if ssh_unit_exists ssh.socket; then
-        socket_state=$(systemctl is-active ssh.socket 2>/dev/null || true)
-        socket_enabled=$(systemctl is-enabled ssh.socket 2>/dev/null || true)
-        ssh_uses_ubuntu_socket_generator && mask_generator=1
-        if [[ "$socket_state" == "active" || "$socket_enabled" == "enabled" || \
-              "$socket_enabled" == "enabled-runtime" ]]; then
-            if [[ "$mask_generator" == "1" ]] && \
-               systemctl restart ssh.socket >/dev/null 2>&1; then
-                sleep 1
-                listening_ports=$(get_listening_ssh_ports)
-                if [[ "$listening_ports" == "$expected_ports" ]] && \
-                   ssh_ports_accept_loopback "$expected_ports"; then
-                    SSH_RUNTIME_MODE="socket"
-                    detail "SSH" "RESTART" "Ubuntu ssh.socket 已按 sshd 配置重新生成并验证；端口=$expected_ports"
-                    return 0
-                fi
-            fi
-            if [[ "$mask_generator" == "1" ]]; then
-                warn "ssh.socket 未能按目标配置重新监听，将按 Ubuntu 官方回退流程切换到 ssh.service。"
-            else
-                warn "检测到 ssh.socket；该模式不会自动采用 sshd_config 的端口，将按发行版官方流程切换到 ssh.service。"
-            fi
-        else
-            mask_generator=0
-        fi
-        if [[ "$socket_state" == "active" || "$socket_enabled" == "enabled" || \
-              "$socket_enabled" == "enabled-runtime" ]] && \
-           switch_ssh_to_service "$mask_generator"; then
-            sleep 1
-            listening_ports=$(get_listening_ssh_ports)
-            [[ "$listening_ports" == "$expected_ports" ]] || return 1
-            ssh_ports_accept_loopback "$expected_ports" || return 1
-            SSH_RUNTIME_MODE="service"
-            detail "SSH" "RESTART" "已禁用 ssh.socket 并切换到 ssh.service；Ubuntu generator 屏蔽=$mask_generator"
-            return 0
-        fi
-        if [[ "$socket_state" == "active" || "$socket_enabled" == "enabled" || \
-              "$socket_enabled" == "enabled-runtime" ]]; then
-            return 1
-        fi
+    if [[ -z "$expected_ports" ]]; then
+        SSH_RESTART_FAILURE="无法读取 sshd 最终有效端口"
+        return 1
+    fi
+
+    command_output=$(systemctl daemon-reload 2>&1)
+    command_status=$?
+    if (( command_status != 0 )); then
+        SSH_RESTART_FAILURE="systemctl daemon-reload exit=$command_status；输出=${command_output:-无}"
+        return 1
     fi
 
     SSH_RUNTIME_MODE="service"
-    if ! systemctl restart ssh.service >/dev/null 2>&1 && \
-       ! systemctl restart ssh >/dev/null 2>&1 && \
-       ! systemctl restart sshd >/dev/null 2>&1; then
+    command_output=$(systemctl restart ssh.service 2>&1)
+    command_status=$?
+    if (( command_status != 0 )); then
+        SSH_RESTART_FAILURE="systemctl restart ssh.service exit=$command_status；输出=${command_output:-无}"
         return 1
     fi
-    sleep 1
-    listening_ports=$(get_listening_ssh_ports)
-    [[ "$listening_ports" == "$expected_ports" ]] && \
-        ssh_ports_accept_loopback "$expected_ports"
+
+    for ((attempt=1; attempt<=10; attempt++)); do
+        if ! systemctl is-active --quiet ssh.service; then
+            if systemctl is-failed --quiet ssh.service; then
+                SSH_RESTART_FAILURE="ssh.service 在第 $attempt 次检查时进入 failed"
+                return 1
+            fi
+            sleep 1
+            continue
+        fi
+
+        listening_ports=$(get_listening_ssh_ports)
+        if [[ "$listening_ports" != "$expected_ports" ]]; then
+            sleep 1
+            continue
+        fi
+        if ! ssh_ports_accept_loopback "$expected_ports"; then
+            sleep 1
+            continue
+        fi
+
+        detail "SSH" "RESTART" "ssh.service 已就绪；端口=$expected_ports；本机 SSH 协议握手通过；attempt=$attempt"
+        SSH_RESTART_FAILURE=""
+        return 0
+    done
+
+    SSH_RESTART_FAILURE="ssh.service 10 秒内未通过监听与本机 SSH 协议握手验证；期望=$expected_ports；实际=${listening_ports:-未检测到}"
+    return 1
+}
+
+validate_sshd_syntax() {
+    local command_output=""
+    local command_status=0
+
+    command_output=$(sshd -t 2>&1)
+    command_status=$?
+    if (( command_status != 0 )); then
+        SSH_CONFIG_FAILURE="sshd -t exit=$command_status；输出=${command_output:-无}"
+        detail "SSH" "CONFIG_TEST" "$SSH_CONFIG_FAILURE"
+        return 1
+    fi
+    SSH_CONFIG_FAILURE=""
+    detail "SSH" "CONFIG_TEST" "sshd -t 通过"
+    return 0
 }
 
 begin_swap_transaction() {
@@ -2453,13 +2502,16 @@ begin_swap_transaction() {
     SWAP_SYSCTL_EXISTED=0
     SWAP_PREVIOUS_SWAPPINESS=$(sysctl -n vm.swappiness 2>/dev/null)
 
-    if [[ ! -f /etc/fstab || -L /etc/fstab ]]; then
-        error "/etc/fstab 不是可安全替换的普通文件，已停止 SWAP 操作。"
+    if [[ ! -f "$FSTAB_FILE" || -L "$FSTAB_FILE" ]]; then
+        error "$FSTAB_FILE 不是可安全替换的普通文件，已停止 SWAP 操作。"
         return 1
     fi
     prepare_backup_path "$SWAP_BACKUP_PATH" || return 1
     mkdir -p "$(dirname "$SWAP_SYSCTL_FILE")" || return 1
-    cp -a /etc/fstab "$SWAP_BACKUP_PATH/fstab" || return 1
+    if ! cp -a -- "$FSTAB_FILE" "$SWAP_BACKUP_PATH/fstab"; then
+        error "[SWAP][BACKUP] 无法备份 $FSTAB_FILE。"
+        return 1
+    fi
     if [[ -e "$SWAP_SYSCTL_FILE" || -L "$SWAP_SYSCTL_FILE" ]]; then
         if [[ -L "$SWAP_SYSCTL_FILE" || ! -f "$SWAP_SYSCTL_FILE" ]]; then
             error "$SWAP_SYSCTL_FILE 不是可安全替换的普通文件，已停止操作。"
@@ -2474,16 +2526,28 @@ begin_swap_transaction() {
 restore_swap_persistence() {
     local failed=0
 
-    cp -a "$SWAP_BACKUP_PATH/fstab" /etc/fstab || failed=1
-    if [[ "$SWAP_SYSCTL_EXISTED" == "1" ]]; then
-        cp -a "$SWAP_BACKUP_PATH/swappiness.conf" "$SWAP_SYSCTL_FILE" || failed=1
-    else
-        rm -f "$SWAP_SYSCTL_FILE" || failed=1
+    if ! cp -a -- "$SWAP_BACKUP_PATH/fstab" "$FSTAB_FILE"; then
+        failed=1
     fi
-    systemctl daemon-reload >/dev/null 2>&1 || failed=1
+    if [[ "$SWAP_SYSCTL_EXISTED" == "1" ]]; then
+        if ! cp -a -- "$SWAP_BACKUP_PATH/swappiness.conf" "$SWAP_SYSCTL_FILE"; then
+            failed=1
+        fi
+    else
+        if ! rm -f -- "$SWAP_SYSCTL_FILE"; then
+            failed=1
+        fi
+    fi
+    if ! systemctl daemon-reload >/dev/null 2>&1; then
+        failed=1
+    fi
     if [[ -n "$SWAP_PREVIOUS_SWAPPINESS" ]]; then
-        sysctl -w "vm.swappiness=$SWAP_PREVIOUS_SWAPPINESS" >/dev/null 2>&1 || failed=1
-        [[ "$(sysctl -n vm.swappiness 2>/dev/null)" == "$SWAP_PREVIOUS_SWAPPINESS" ]] || failed=1
+        if ! sysctl -w "vm.swappiness=$SWAP_PREVIOUS_SWAPPINESS" >/dev/null 2>&1; then
+            failed=1
+        fi
+        if [[ "$(sysctl -n vm.swappiness 2>/dev/null)" != "$SWAP_PREVIOUS_SWAPPINESS" ]]; then
+            failed=1
+        fi
     fi
     return "$failed"
 }
@@ -2547,7 +2611,7 @@ rollback_swap_creation() {
     local failed=0
     local can_remove=1
 
-    detail "SWAP" "ROLLBACK_CREATE" "开始回滚未完成的 SWAP 创建；文件=$MANAGED_SWAP_FILE；备份=$SWAP_BACKUP_PATH"
+    detail "SWAP" "ROLLBACK" "操作=创建；开始回滚；文件=$MANAGED_SWAP_FILE；备份=$SWAP_BACKUP_PATH"
 
     if swapon --show=NAME --noheadings --raw 2>/dev/null | grep -Fxq "$MANAGED_SWAP_FILE"; then
         if ! swapoff "$MANAGED_SWAP_FILE" >/dev/null 2>&1; then
@@ -2555,17 +2619,18 @@ rollback_swap_creation() {
             can_remove=0
         fi
     fi
-    if [[ "$can_remove" == "1" && -e "$MANAGED_SWAP_FILE" ]] && \
-       ! rm -f "$MANAGED_SWAP_FILE" >/dev/null 2>&1; then
-        failed=1
+    if [[ "$can_remove" == "1" && -e "$MANAGED_SWAP_FILE" ]]; then
+        if ! rm -f -- "$MANAGED_SWAP_FILE" >/dev/null 2>&1; then
+            failed=1
+        fi
     fi
     restore_swap_persistence || failed=1
     if [[ "$failed" == "1" ]]; then
-        detail "SWAP" "ROLLBACK_CREATE" "自动恢复不完整；文件存在=$([[ -e "$MANAGED_SWAP_FILE" ]] && printf 是 || printf 否)；备份=$SWAP_BACKUP_PATH"
+        detail "SWAP" "ROLLBACK" "操作=创建；自动恢复不完整；文件存在=$([[ -e "$MANAGED_SWAP_FILE" ]] && printf 是 || printf 否)；备份=$SWAP_BACKUP_PATH"
         error "SWAP 自动回滚未完全成功，请从 $SWAP_BACKUP_PATH 手动恢复。"
         return 1
     fi
-    detail "SWAP" "ROLLBACK_CREATE" "fstab、swappiness 和托管 SWAP 文件恢复成功"
+    detail "SWAP" "ROLLBACK" "操作=创建；fstab、swappiness 和托管 SWAP 文件恢复成功"
     warn "未完成的 SWAP 创建已回滚，fstab、swappiness 与 /swapfile 已恢复。"
     return 0
 }
@@ -2574,7 +2639,7 @@ rollback_swap_removal() {
     local was_active="$1"
     local failed=0
 
-    detail "SWAP" "ROLLBACK_REMOVE" "开始恢复 SWAP 删除操作；原活动=$was_active；备份=$SWAP_BACKUP_PATH"
+    detail "SWAP" "ROLLBACK" "操作=删除；开始恢复；原活动=$was_active；备份=$SWAP_BACKUP_PATH"
 
     restore_swap_persistence || failed=1
     if [[ "$was_active" == "1" ]] && \
@@ -2582,9 +2647,9 @@ rollback_swap_removal() {
         swapon "$MANAGED_SWAP_FILE" >/dev/null 2>&1 || failed=1
     fi
     if [[ "$failed" == "0" ]]; then
-        detail "SWAP" "ROLLBACK_REMOVE" "fstab、swappiness 和运行状态恢复成功"
+        detail "SWAP" "ROLLBACK" "操作=删除；fstab、swappiness 和运行状态恢复成功"
     else
-        detail "SWAP" "ROLLBACK_REMOVE" "自动恢复不完整；备份=$SWAP_BACKUP_PATH"
+        detail "SWAP" "ROLLBACK" "操作=删除；自动恢复不完整；备份=$SWAP_BACKUP_PATH"
     fi
     return "$failed"
 }
@@ -2645,6 +2710,139 @@ remove_managed_swappiness() {
     SWAP_RESTORED_SWAPPINESS="$restore_value"
 }
 
+set_managed_swappiness() {
+    local target_value="$1"
+    local previous_value=""
+    local original_marker=""
+    local backup_file=""
+    local temp_file=""
+    local file_existed=0
+    local command_output=""
+    local command_status=0
+    local rollback_failed=0
+
+    if [[ ! "$target_value" =~ ^[0-9]+$ ]] || (( 10#$target_value > 100 )); then
+        error "vm.swappiness 必须是 0 到 100 的整数。"
+        return 1
+    fi
+    previous_value=$(sysctl -n vm.swappiness 2>/dev/null)
+    if [[ ! "$previous_value" =~ ^[0-9]+$ ]]; then
+        error "无法读取当前 vm.swappiness，未修改配置。"
+        return 1
+    fi
+    if [[ -L "$SWAP_SYSCTL_FILE" ]] || [[ -e "$SWAP_SYSCTL_FILE" && ! -f "$SWAP_SYSCTL_FILE" ]]; then
+        error "$SWAP_SYSCTL_FILE 不是可安全替换的普通文件。"
+        return 1
+    fi
+    if ! mkdir -p "$(dirname "$SWAP_SYSCTL_FILE")"; then
+        error "无法创建 swappiness 配置目录。"
+        return 1
+    fi
+    if ! prepare_private_directory "$BACKUP_DIR"; then
+        error "无法创建 swappiness 备份目录。"
+        return 1
+    fi
+
+    if [[ -f "$SWAP_SYSCTL_FILE" ]]; then
+        file_existed=1
+        backup_file="$BACKUP_DIR/$(basename "$SWAP_SYSCTL_FILE").$(date +%Y%m%d%H%M%S)-$$.bak"
+        if ! cp -a -- "$SWAP_SYSCTL_FILE" "$backup_file"; then
+            error "无法备份 $SWAP_SYSCTL_FILE。"
+            return 1
+        fi
+        original_marker=$(awk -F= '/^[[:space:]]*#[[:space:]]*vps-init-previous-vm-swappiness[[:space:]]*=/ {
+            value=$2; gsub(/[[:space:]]/, "", value); saved=value
+        } END {print saved}' "$SWAP_SYSCTL_FILE")
+    fi
+    if [[ ! "$original_marker" =~ ^[0-9]+$ ]]; then
+        original_marker="$previous_value"
+    fi
+
+    temp_file=$(mktemp "$(dirname "$SWAP_SYSCTL_FILE")/.vps-init-swappiness.XXXXXX")
+    if [[ -z "$temp_file" ]]; then
+        error "无法创建 swappiness 临时文件。"
+        return 1
+    fi
+    if [[ "$file_existed" == "1" ]]; then
+        if ! cp -a -- "$SWAP_SYSCTL_FILE" "$temp_file"; then
+            rm -f -- "$temp_file"
+            return 1
+        fi
+    else
+        if ! chmod 644 "$temp_file"; then
+            rm -f -- "$temp_file"
+            return 1
+        fi
+        if ! chown root:root "$temp_file"; then
+            rm -f -- "$temp_file"
+            return 1
+        fi
+    fi
+    if ! sed -i -E \
+        -e '/^[[:space:]]*#[[:space:]]*vps-init-previous-vm-swappiness[[:space:]]*=/d' \
+        -e '\|^[[:space:]]*-?[[:space:]]*vm[./]swappiness[[:space:]]*=|d' \
+        "$temp_file"; then
+        rm -f -- "$temp_file"
+        return 1
+    fi
+    if ! ensure_text_file_ends_with_newline "$temp_file"; then
+        rm -f -- "$temp_file"
+        return 1
+    fi
+    if ! printf '# vps-init-previous-vm-swappiness = %s\nvm.swappiness = %s\n' \
+        "$original_marker" "$target_value" >> "$temp_file"; then
+        rm -f -- "$temp_file"
+        return 1
+    fi
+    if ! mv -f -- "$temp_file" "$SWAP_SYSCTL_FILE"; then
+        rm -f -- "$temp_file"
+        return 1
+    fi
+
+    if [[ "$(get_effective_sysctl_value vm.swappiness)" != "$target_value" ]]; then
+        error "[SWAP][SWAPPINESS] 持久化最终值被其他 sysctl 配置覆盖。"
+        rollback_failed=1
+    else
+        command_output=$(sysctl -w "vm.swappiness=$target_value" 2>&1)
+        command_status=$?
+        if (( command_status != 0 )); then
+            detail "SWAP" "SWAPPINESS" "exit=$command_status；输出=${command_output:-无}"
+            error "[SWAP][SWAPPINESS] 运行值应用失败。"
+            rollback_failed=1
+        elif [[ "$(sysctl -n vm.swappiness 2>/dev/null)" != "$target_value" ]]; then
+            error "[SWAP][SWAPPINESS] 运行值验证失败。"
+            rollback_failed=1
+        fi
+    fi
+
+    if [[ "$rollback_failed" == "0" ]]; then
+        detail "SWAP" "SWAPPINESS" "运行值=$target_value；持久化=$SWAP_SYSCTL_FILE；原始值=$original_marker；备份=${backup_file:-无}"
+        action_success "vm.swappiness" "$previous_value → $target_value；配置：$SWAP_SYSCTL_FILE"
+        return 0
+    fi
+
+    if [[ "$file_existed" == "1" ]]; then
+        if ! cp -a -- "$backup_file" "$SWAP_SYSCTL_FILE"; then
+            rollback_failed=2
+        fi
+    else
+        if ! rm -f -- "$SWAP_SYSCTL_FILE"; then
+            rollback_failed=2
+        fi
+    fi
+    if ! sysctl -w "vm.swappiness=$previous_value" >/dev/null 2>&1; then
+        rollback_failed=2
+    fi
+    if [[ "$rollback_failed" == "2" ]]; then
+        detail "SWAP" "ROLLBACK" "操作=swappiness；回滚不完整；备份=${backup_file:-无}"
+        error "vm.swappiness 应用失败且回滚不完整。"
+    else
+        detail "SWAP" "ROLLBACK" "操作=swappiness；配置和运行值已恢复"
+        error "vm.swappiness 应用失败，原配置和运行值已恢复。"
+    fi
+    return 1
+}
+
 swap_memory_headroom_bytes() {
     local total_bytes="$1"
     local headroom=$((64 * 1024 * 1024))
@@ -2673,7 +2871,7 @@ managed_swap_fstab_entry_exists() {
             found=1
         }
         END {exit !found}
-    ' /etc/fstab
+    ' "$FSTAB_FILE"
 }
 
 ensure_text_file_ends_with_newline() {
@@ -2719,7 +2917,7 @@ preflight_swap_creation() {
 }
 
 system_has_any_swap_configuration() {
-    local fstab_file="${1:-/etc/fstab}"
+    local fstab_file="${1:-$FSTAB_FILE}"
 
     if swapon --show=NAME --noheadings --raw 2>/dev/null | grep -q '[^[:space:]]'; then
         return 0
@@ -2757,32 +2955,49 @@ preflight_swap_removal() {
 
 create_managed_swap() {
     local swap_size="$1"
-    local expected_bytes
-    local count_val
-    local actual_bytes
-    local fstab_temp
-    local number
-    local unit
+    local expected_bytes=""
+    local count_val=0
+    local actual_bytes=""
+    local fstab_temp=""
+    local number=""
+    local unit=""
+    local command_output=""
+    local command_status=0
+    local current_swappiness=""
+    local stage_output_file=""
 
-    [[ "$swap_size" =~ ^[1-9][0-9]*[MGmg]$ ]] || {
+    if [[ ! "$swap_size" =~ ^[1-9][0-9]*[MGmg]$ ]]; then
         error "SWAP 大小格式无效。"
         return 1
-    }
+    fi
     if system_has_any_swap_configuration; then
         error "检测到已存在活动或持久化 SWAP 配置，脚本不会叠加或覆盖。"
         return 1
     fi
     number="${swap_size//[^0-9]/}"
     unit="${swap_size//[0-9]/}"
-    if (( ${#number} > 7 )) || \
-       { [[ "${unit^^}" == "G" ]] && (( 10#$number > 1024 )); } || \
-       { [[ "${unit^^}" == "M" ]] && (( 10#$number > 1048576 )); }; then
+    if (( ${#number} > 7 )); then
+        error "SWAP 大小不能超过 1TiB。"
+        return 1
+    fi
+    if [[ "${unit^^}" == "G" ]] && (( 10#$number > 1024 )); then
+        error "SWAP 大小不能超过 1TiB。"
+        return 1
+    fi
+    if [[ "${unit^^}" == "M" ]] && (( 10#$number > 1048576 )); then
         error "SWAP 大小不能超过 1TiB。"
         return 1
     fi
 
     if command -v numfmt >/dev/null 2>&1; then
-        expected_bytes=$(numfmt --from=iec "$swap_size" 2>/dev/null) || return 1
+        command_output=$(numfmt --from=iec "$swap_size" 2>&1)
+        command_status=$?
+        if (( command_status != 0 )); then
+            detail "SWAP" "PRECHECK" "大小换算失败；exit=$command_status；输出=${command_output:-无}"
+            error "无法换算 SWAP 大小。"
+            return 1
+        fi
+        expected_bytes="$command_output"
     else
         if [[ "${unit^^}" == "G" ]]; then
             expected_bytes=$((10#$number * 1024 * 1024 * 1024))
@@ -2797,7 +3012,10 @@ create_managed_swap() {
     fi
     count_val=$((expected_bytes / 1048576))
 
-    preflight_swap_creation "$expected_bytes" || return 1
+    if ! preflight_swap_creation "$expected_bytes"; then
+        detail "SWAP" "PRECHECK" "磁盘容量检查失败；大小=$swap_size；字节=$expected_bytes"
+        return 1
+    fi
     if [[ -e "$MANAGED_SWAP_FILE" || -L "$MANAGED_SWAP_FILE" ]]; then
         error "$MANAGED_SWAP_FILE 已存在，为避免覆盖未知文件已停止创建。"
         return 1
@@ -2809,51 +3027,149 @@ create_managed_swap() {
     fi
 
     log "正在创建 $swap_size 的 SWAP 文件..."
-    if ! create_swap_backing_file "$count_val"; then
-        error "SWAP 文件创建失败。"
+    stage_output_file=$(mktemp "$SWAP_BACKUP_PATH/.create-file.XXXXXX")
+    command_status=$?
+    if (( command_status != 0 )) || [[ -z "$stage_output_file" ]]; then
+        error "[SWAP][CREATE_FILE] 无法创建阶段输出文件。"
         rollback_swap_creation
         return 1
     fi
+    create_swap_backing_file "$count_val" > "$stage_output_file" 2>&1
+    command_status=$?
+    command_output=$(<"$stage_output_file")
+    rm -f -- "$stage_output_file"
+    if (( command_status != 0 )); then
+        detail "SWAP" "CREATE_FILE" "exit=$command_status；输出=${command_output:-无}"
+        error "[SWAP][CREATE_FILE] SWAP 文件创建失败。"
+        rollback_swap_creation
+        return 1
+    fi
+    detail "SWAP" "CREATE_FILE" "创建成功；文件=$MANAGED_SWAP_FILE；预格式化=$SWAP_BACKING_FORMATTED；输出=${command_output:-无}"
 
     actual_bytes=$(stat -c%s "$MANAGED_SWAP_FILE" 2>/dev/null)
     if [[ "$actual_bytes" != "$expected_bytes" ]]; then
-        error "SWAP 文件大小校验失败：期望 $expected_bytes bytes，实际 ${actual_bytes:-未知}。"
-        rollback_swap_creation
-        return 1
-    fi
-    if ! chmod 600 "$MANAGED_SWAP_FILE" || \
-       { [[ "$SWAP_BACKING_FORMATTED" == "1" ]] || mkswap "$MANAGED_SWAP_FILE" >/dev/null; } || \
-       ! swapon "$MANAGED_SWAP_FILE"; then
-        error "SWAP 初始化或启用失败。"
+        error "[SWAP][CREATE_FILE] 文件大小校验失败：期望 $expected_bytes bytes，实际 ${actual_bytes:-未知}。"
         rollback_swap_creation
         return 1
     fi
 
-    fstab_temp=$(mktemp /etc/.vps-init-fstab.XXXXXX) || {
-        rollback_swap_creation
-        return 1
-    }
-    if ! cp -a /etc/fstab "$fstab_temp" || \
-       ! ensure_text_file_ends_with_newline "$fstab_temp" || \
-       ! printf '%s none swap sw 0 0 # managed by vps-init\n' "$MANAGED_SWAP_FILE" >> "$fstab_temp" || \
-       ! mv -f "$fstab_temp" /etc/fstab; then
-        rm -f "$fstab_temp"
-        error "写入 /etc/fstab 失败。"
+    command_output=$(chmod 600 "$MANAGED_SWAP_FILE" 2>&1)
+    command_status=$?
+    if (( command_status != 0 )); then
+        detail "SWAP" "CHMOD" "exit=$command_status；输出=${command_output:-无}"
+        error "[SWAP][CHMOD] 无法将 SWAP 文件权限设置为 600。"
         rollback_swap_creation
         return 1
     fi
-    if ! systemctl daemon-reload >/dev/null 2>&1; then
-        error "fstab 已写入，但 systemd 配置重载失败。"
+    if [[ "$(stat -c '%a' "$MANAGED_SWAP_FILE" 2>/dev/null)" != "600" ]]; then
+        detail "SWAP" "CHMOD" "命令返回成功，但权限验证失败"
+        error "[SWAP][CHMOD] SWAP 文件权限验证失败。"
         rollback_swap_creation
         return 1
+    fi
+    detail "SWAP" "CHMOD" "权限=600"
+
+    if [[ "$SWAP_BACKING_FORMATTED" == "1" ]]; then
+        detail "SWAP" "MKSWAP" "Btrfs mkswapfile 已完成格式化，跳过重复 mkswap"
+    else
+        command_output=$(mkswap "$MANAGED_SWAP_FILE" 2>&1)
+        command_status=$?
+        if (( command_status != 0 )); then
+            detail "SWAP" "MKSWAP" "exit=$command_status；输出=${command_output:-无}"
+            error "[SWAP][MKSWAP] SWAP 文件格式化失败。"
+            rollback_swap_creation
+            return 1
+        fi
+        detail "SWAP" "MKSWAP" "exit=0；格式化成功；输出=${command_output:-无}"
     fi
 
-    if ! managed_swap_fstab_entry_exists || \
-       ! swapon --show=NAME --noheadings --raw 2>/dev/null | grep -Fxq "$MANAGED_SWAP_FILE"; then
-        error "SWAP 运行状态或 fstab 托管标记验证失败。"
+    command_output=$(swapon "$MANAGED_SWAP_FILE" 2>&1)
+    command_status=$?
+    if (( command_status != 0 )); then
+        detail "SWAP" "SWAPON" "exit=$command_status；输出=${command_output:-无}"
+        error "[SWAP][SWAPON] SWAP 启用失败。"
         rollback_swap_creation
         return 1
     fi
+    if ! swapon --show=NAME --noheadings --raw 2>/dev/null | grep -Fxq "$MANAGED_SWAP_FILE"; then
+        detail "SWAP" "SWAPON" "命令返回成功，但活动 SWAP 列表中未发现 $MANAGED_SWAP_FILE"
+        error "[SWAP][SWAPON] SWAP 启用后的运行状态验证失败。"
+        rollback_swap_creation
+        return 1
+    fi
+    detail "SWAP" "SWAPON" "exit=0；活动状态验证通过"
+
+    fstab_temp=$(mktemp "$(dirname "$FSTAB_FILE")/.vps-init-fstab.XXXXXX")
+    command_status=$?
+    if (( command_status != 0 )) || [[ -z "$fstab_temp" ]]; then
+        detail "SWAP" "FSTAB" "无法创建同目录临时文件；exit=$command_status"
+        error "[SWAP][FSTAB] 无法创建 fstab 临时文件。"
+        rollback_swap_creation
+        return 1
+    fi
+    if ! cp -a -- "$FSTAB_FILE" "$fstab_temp"; then
+        rm -f -- "$fstab_temp"
+        error "[SWAP][FSTAB] 无法复制原 fstab 到临时文件。"
+        rollback_swap_creation
+        return 1
+    fi
+    if ! ensure_text_file_ends_with_newline "$fstab_temp"; then
+        rm -f -- "$fstab_temp"
+        error "[SWAP][FSTAB] 无法规范化 fstab 文件结尾。"
+        rollback_swap_creation
+        return 1
+    fi
+    if ! printf '%s none swap sw 0 0 # managed by vps-init\n' "$MANAGED_SWAP_FILE" >> "$fstab_temp"; then
+        rm -f -- "$fstab_temp"
+        error "[SWAP][FSTAB] 无法写入托管条目。"
+        rollback_swap_creation
+        return 1
+    fi
+    command_output=$(mv -f -- "$fstab_temp" "$FSTAB_FILE" 2>&1)
+    command_status=$?
+    if (( command_status != 0 )); then
+        rm -f -- "$fstab_temp"
+        detail "SWAP" "FSTAB" "exit=$command_status；输出=${command_output:-无}"
+        error "[SWAP][FSTAB] 无法原子替换 $FSTAB_FILE。"
+        rollback_swap_creation
+        return 1
+    fi
+    command_output=$(systemctl daemon-reload 2>&1)
+    command_status=$?
+    if (( command_status != 0 )); then
+        detail "SWAP" "FSTAB" "systemctl daemon-reload exit=$command_status；输出=${command_output:-无}"
+        error "[SWAP][FSTAB] fstab 已写入，但 systemd 配置重载失败。"
+        rollback_swap_creation
+        return 1
+    fi
+    detail "SWAP" "FSTAB" "托管条目写入成功；文件=$FSTAB_FILE"
+
+    current_swappiness=$(sysctl -n vm.swappiness 2>/dev/null)
+    if [[ ! "$current_swappiness" =~ ^[0-9]+$ ]]; then
+        detail "SWAP" "SWAPPINESS" "无法读取当前运行值"
+        error "[SWAP][SWAPPINESS] 无法验证 vm.swappiness，已回滚。"
+        rollback_swap_creation
+        return 1
+    fi
+    if [[ -n "$SWAP_PREVIOUS_SWAPPINESS" && "$current_swappiness" != "$SWAP_PREVIOUS_SWAPPINESS" ]]; then
+        detail "SWAP" "SWAPPINESS" "期望保持=$SWAP_PREVIOUS_SWAPPINESS；实际=$current_swappiness"
+        error "[SWAP][SWAPPINESS] 运行值意外变化，已回滚。"
+        rollback_swap_creation
+        return 1
+    fi
+    detail "SWAP" "SWAPPINESS" "保持现有运行值=$current_swappiness，不覆盖用户的 sysctl 配置"
+
+    if ! managed_swap_fstab_entry_exists; then
+        error "[SWAP][VERIFY] 未发现 fstab 托管条目。"
+        rollback_swap_creation
+        return 1
+    fi
+    if ! swapon --show=NAME --noheadings --raw 2>/dev/null | grep -Fxq "$MANAGED_SWAP_FILE"; then
+        error "[SWAP][VERIFY] 活动 SWAP 列表中未发现 $MANAGED_SWAP_FILE。"
+        rollback_swap_creation
+        return 1
+    fi
+    detail "SWAP" "VERIFY" "创建、权限、格式化、启用、fstab 与 swappiness 全部验证通过"
 
     action_success "SWAP 创建" "$swap_size；保留 vm.swappiness=${SWAP_PREVIOUS_SWAPPINESS:-系统值}；运行状态和持久化验证通过；备份：$SWAP_BACKUP_PATH"
 }
@@ -2882,7 +3198,7 @@ remove_managed_swap() {
         return 1
     fi
 
-    fstab_temp=$(mktemp /etc/.vps-init-fstab.XXXXXX) || {
+    fstab_temp=$(mktemp "$(dirname "$FSTAB_FILE")/.vps-init-fstab.XXXXXX") || {
         if rollback_swap_removal "$was_active"; then
             error "fstab 临时文件创建失败，SWAP 运行状态已恢复。"
         else
@@ -2892,10 +3208,10 @@ remove_managed_swap() {
     }
     if ! awk -v path="$MANAGED_SWAP_FILE" \
         '!($1==path && $3=="swap" && tolower($0) ~ /managed by vps-init/)' \
-        /etc/fstab > "$fstab_temp" || \
-       ! chmod --reference=/etc/fstab "$fstab_temp" || \
-       ! chown --reference=/etc/fstab "$fstab_temp" || \
-       ! mv -f "$fstab_temp" /etc/fstab; then
+        "$FSTAB_FILE" > "$fstab_temp" || \
+       ! chmod --reference="$FSTAB_FILE" "$fstab_temp" || \
+       ! chown --reference="$FSTAB_FILE" "$fstab_temp" || \
+       ! mv -f "$fstab_temp" "$FSTAB_FILE"; then
         rm -f "$fstab_temp"
         if rollback_swap_removal "$was_active"; then
             error "fstab 更新失败，原配置与 SWAP 运行状态已恢复。"
@@ -2960,10 +3276,11 @@ submenu_swap() {
         print_menu_item 1 "快速添加 1GB SWAP"
         print_menu_item 2 "快速添加 2GB SWAP"
         print_menu_item 3 "手动输入 SWAP 大小" "支持 MB/GB"
-        echo -e "  ${RED}4. [需确认] 删除脚本管理的 /swapfile${NC}"
+        print_menu_item 4 "设置 vm.swappiness" "0-100"
+        echo -e "  ${RED}5. [需确认] 删除脚本管理的 /swapfile${NC}"
         echo -e "  ${DIM}0. 返回上一级${NC}"
         echo -e "${CYAN}==================================================${NC}"
-        read -r -p "请输入选项 [0-4]: " choice_swap
+        read -r -p "请输入选项 [0-5]: " choice_swap
 
         if [[ "$choice_swap" =~ ^[1-3]$ ]]; then
             if system_has_any_swap_configuration; then
@@ -2983,6 +3300,16 @@ submenu_swap() {
                 fi
                 ;;
             4)
+                read -r -p "请输入 vm.swappiness [0-100]: " swap_swappiness
+                if [[ ! "$swap_swappiness" =~ ^[0-9]+$ ]] || (( 10#$swap_swappiness > 100 )); then
+                    error "请输入 0 到 100 的整数。"
+                    pause_menu; continue
+                fi
+                confirm_action "确认将 vm.swappiness 设置为 $swap_swappiness 吗？" || continue
+                set_managed_swappiness "$swap_swappiness"
+                pause_menu; continue
+                ;;
+            5)
                 SWAP_ACTIVE=0
                 SWAP_CONFIGURED=0
                 swapon --show=NAME --noheadings --raw 2>/dev/null | grep -Fxq "$MANAGED_SWAP_FILE" && SWAP_ACTIVE=1
@@ -3185,7 +3512,7 @@ submenu_timezone() {
                 pause_menu; continue
             fi
             validate_official_package_install_plan \
-                "时间同步服务" 0 systemd-timesyncd || {
+                "时间同步服务" systemd-timesyncd || {
                 detail "TIME" "INSTALL_PREVIEW" "systemd-timesyncd 安装预览未通过无删除或官方来源边界"
                 action_partial "时区配置" "时区已设置为 $target_tz，但 systemd-timesyncd 安装预览未通过"
                 pause_menu; continue
@@ -3396,8 +3723,7 @@ validate_package_install_without_removals() {
 
 validate_official_package_install_plan() {
     local label="$1"
-    local allow_ubuntu_esm_apps="$2"
-    shift 2
+    shift
     local simulation_output
     local record
     local package
@@ -3407,7 +3733,6 @@ validate_official_package_install_plan() {
     local -a version_records=()
     local -A planned_versions=()
 
-    [[ "$allow_ubuntu_esm_apps" == "0" || "$allow_ubuntu_esm_apps" == "1" ]] || return 2
     if ! simulation_output=$(LC_ALL=C apt-get -s -o Debug::NoLocking=1 \
         install --no-remove -- "$@" 2>&1); then
         error "$label 的安装预览失败，已停止操作："
@@ -3432,8 +3757,7 @@ validate_official_package_install_plan() {
     done
     for package in "${!planned_versions[@]}"; do
         version="${planned_versions[$package]}"
-        validate_official_candidate_source \
-            "$package" "$version" "$allow_ubuntu_esm_apps" || {
+        validate_official_candidate_source "$package" "$version" || {
             error "$label 的计划软件包不完全来自当前发行版的官方稳定更新范围。"
             return 1
         }
@@ -3456,33 +3780,12 @@ is_kernel_meta_package_name() {
         *-dbg|*-dbgsym|*-signed-template)
             return 1
             ;;
-        linux-image-[0-9]*|linux-image-unsigned-[0-9]*|linux-image-extra-[0-9]*|\
-        linux-headers-[0-9]*|linux-modules-[0-9]*|linux-modules-extra-[0-9]*|\
-        linux-tools-[0-9]*|linux-cloud-tools-[0-9]*)
+        linux-image-[0-9]*|linux-headers-[0-9]*)
             return 1
             ;;
     esac
 
-    case "$OS_ID" in
-        debian)
-            [[ "$package" == linux-image-* ]]
-            return
-            ;;
-        ubuntu)
-            case "$package" in
-                linux-image-generic*|linux-image-virtual*|linux-image-aws*|\
-                linux-image-azure*|linux-image-gcp*|linux-image-oracle*|\
-                linux-image-kvm*|linux-image-lowlatency*|linux-image-oem-*|\
-                linux-generic|linux-generic-*|linux-virtual|linux-virtual-*|\
-                linux-aws|linux-aws-*|linux-azure|linux-azure-*|linux-gcp|linux-gcp-*|\
-                linux-oracle|linux-oracle-*|linux-kvm|linux-kvm-*|\
-                linux-lowlatency|linux-lowlatency-*|linux-oem-*)
-                    return 0
-                    ;;
-            esac
-            ;;
-    esac
-    return 1
+    [[ "$OS_ID" == "debian" && "$package" == linux-image-* ]]
 }
 
 is_kernel_update_package() {
@@ -3506,32 +3809,14 @@ is_kernel_update_package() {
 kernel_flavor_from_release() {
     local release="$1"
 
-    case "$OS_ID" in
-        debian)
-            if [[ "$release" =~ \+deb[0-9]+-(.+)$ ]]; then
-                printf '%s\n' "${BASH_REMATCH[1]}"
-            elif [[ "$release" =~ ^[0-9].*-[0-9]+-(.+)$ ]]; then
-                printf '%s\n' "${BASH_REMATCH[1]}"
-            else
-                return 1
-            fi
-            ;;
-        ubuntu)
-            case "$release" in
-                *-generic) printf '%s\n' generic ;;
-                *-lowlatency) printf '%s\n' lowlatency ;;
-                *-aws) printf '%s\n' aws ;;
-                *-azure) printf '%s\n' azure ;;
-                *-gcp) printf '%s\n' gcp ;;
-                *-oracle) printf '%s\n' oracle ;;
-                *-kvm) printf '%s\n' kvm ;;
-                *) return 1 ;;
-            esac
-            ;;
-        *)
-            return 1
-            ;;
-    esac
+    [[ "$OS_ID" == "debian" ]] || return 1
+    if [[ "$release" =~ \+deb[0-9]+-(.+)$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    elif [[ "$release" =~ ^[0-9].*-[0-9]+-(.+)$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    else
+        return 1
+    fi
 }
 
 latest_installed_kernel_for_current_flavor() {
@@ -3555,9 +3840,7 @@ is_versioned_kernel_package() {
     local package="${1%%:*}"
 
     case "$package" in
-        linux-image-[0-9]*|linux-image-unsigned-[0-9]*|linux-image-extra-[0-9]*|\
-        linux-headers-[0-9]*|linux-modules-[0-9]*|linux-modules-extra-[0-9]*|\
-        linux-tools-[0-9]*|linux-cloud-tools-[0-9]*|linux-restricted-modules-[0-9]*)
+        linux-image-[0-9]*|linux-headers-[0-9]*)
             return 0
             ;;
     esac
@@ -3583,22 +3866,9 @@ kernel_versioned_package_matches_release_list() {
     local -n release_list="$release_array_name"
 
     case "$package" in
-        linux-image-unsigned-[0-9]*) suffix="${package#linux-image-unsigned-}" ;;
-        linux-image-extra-[0-9]*) suffix="${package#linux-image-extra-}" ;;
         linux-image-[0-9]*) suffix="${package#linux-image-}" ;;
-        linux-modules-extra-[0-9]*) suffix="${package#linux-modules-extra-}" ;;
-        linux-modules-[0-9]*) suffix="${package#linux-modules-}" ;;
-        linux-restricted-modules-[0-9]*) suffix="${package#linux-restricted-modules-}" ;;
         linux-headers-[0-9]*)
             suffix="${package#linux-headers-}"
-            shared_release=1
-            ;;
-        linux-cloud-tools-[0-9]*)
-            suffix="${package#linux-cloud-tools-}"
-            shared_release=1
-            ;;
-        linux-tools-[0-9]*)
-            suffix="${package#linux-tools-}"
             shared_release=1
             ;;
         *) return 1 ;;
@@ -3626,32 +3896,11 @@ kernel_meta_route_and_flavor() {
     KERNEL_META_PRIORITY=0
     is_kernel_meta_package_name "$package" || return 1
 
-    if [[ "$OS_ID" == "debian" ]]; then
-        route="${package#linux-image-}"
-        KERNEL_META_ROUTE="$route"
-        KERNEL_META_FLAVOR="$route"
-        KERNEL_META_PRIORITY=1
-        return 0
-    fi
-
-    if [[ "$package" == linux-image-* ]]; then
-        route="${package#linux-image-}"
-        KERNEL_META_PRIORITY=1
-    else
-        route="${package#linux-}"
-        KERNEL_META_PRIORITY=2
-    fi
+    [[ "$OS_ID" == "debian" ]] || return 1
+    route="${package#linux-image-}"
     KERNEL_META_ROUTE="$route"
-    case "$route" in
-        generic*|virtual*|oem-*) KERNEL_META_FLAVOR="generic" ;;
-        lowlatency*) KERNEL_META_FLAVOR="lowlatency" ;;
-        aws*) KERNEL_META_FLAVOR="aws" ;;
-        azure*) KERNEL_META_FLAVOR="azure" ;;
-        gcp*) KERNEL_META_FLAVOR="gcp" ;;
-        oracle*) KERNEL_META_FLAVOR="oracle" ;;
-        kvm*) KERNEL_META_FLAVOR="kvm" ;;
-        *) return 1 ;;
-    esac
+    KERNEL_META_FLAVOR="$route"
+    KERNEL_META_PRIORITY=1
 }
 
 list_installed_kernel_root_meta_packages() {
@@ -3747,70 +3996,47 @@ get_candidate_package_version() {
 
 kernel_source_record_allowed() {
     local record="$1"
-    local allow_ubuntu_esm_apps="${2:-0}"
     local codename="$OS_CODENAME"
-    local source_record="${record%%$'\t'*}"
     local metadata="${record#*$'\t'}"
     local release_record="${metadata%%$'\t'*}"
     local release_csv
-    local pocket=""
+    local expected_codename=""
 
     [[ "$codename" =~ ^[a-z0-9]+$ ]] || return 1
     [[ "$record" == *$'\t'* && "$metadata" == *$'\t'* ]] || return 1
     release_record="${release_record#release }"
     release_csv=",${release_record},"
-    case "$OS_ID" in
-        debian)
-            [[ "$release_csv" == *,o=Debian,* ]] || return 1
-            case "$release_csv" in
-                *,c=main,*|*,c=contrib,*|*,c=non-free,*|*,c=non-free-firmware,*) ;;
-                *) return 1 ;;
-            esac
-            case " $source_record " in
-                *" $codename/"*|*" stable/"*|*" oldstable/"*) pocket="$codename" ;;
-                *" ${codename}-updates/"*|*" stable-updates/"*|*" oldstable-updates/"*) pocket="${codename}-updates" ;;
-                *" ${codename}-security/"*|*" stable-security/"*|*" oldstable-security/"*) pocket="${codename}-security" ;;
-                *) return 1 ;;
-            esac
-            if [[ "$release_csv" != *,n="$pocket",* ]] && \
-               ! [[ "$pocket" == "$codename" && "$release_csv" == *,n="$codename",* ]]; then
-                return 1
-            fi
-            ;;
-        ubuntu)
-            case "$release_csv" in
-                *,c=main,*|*,c=restricted,*|*,c=universe,*|*,c=multiverse,*) ;;
-                *) return 1 ;;
-            esac
-            case " $source_record " in
-                *" $codename/"*) pocket="$codename" ;;
-                *" ${codename}-updates/"*) pocket="${codename}-updates" ;;
-                *" ${codename}-security/"*) pocket="${codename}-security" ;;
-                *" ${codename}-infra-security/"*) pocket="${codename}-infra-security" ;;
-                *" ${codename}-infra-updates/"*) pocket="${codename}-infra-updates" ;;
-                *" ${codename}-apps-security/"*) pocket="${codename}-apps-security" ;;
-                *" ${codename}-apps-updates/"*) pocket="${codename}-apps-updates" ;;
-                *) return 1 ;;
-            esac
-            case "$pocket" in
-                "$codename"|"${codename}-updates"|"${codename}-security")
-                    [[ "$release_csv" == *,o=Ubuntu,* ]] || return 1
-                    ;;
-                "${codename}-infra-security"|"${codename}-infra-updates")
-                    [[ "$release_csv" == *,o=UbuntuESM,* ]] || return 1
-                    ;;
-                "${codename}-apps-security"|"${codename}-apps-updates")
-                    [[ "$allow_ubuntu_esm_apps" == "1" ]] || return 1
-                    [[ "$release_csv" == *,o=UbuntuESM,* ]] || return 1
-                    ;;
-            esac
-            [[ "$release_csv" == *,n="$codename",* || "$release_csv" == *,n="$pocket",* ]] || return 1
-            if [[ "$release_csv" != *,a="$pocket",* ]] && \
-               ! [[ "$pocket" == "$codename" && "$release_csv" == *,a="$codename",* ]]; then
-                return 1
-            fi
-            ;;
+    [[ "$OS_ID" == "debian" ]] || return 1
+    [[ "$release_csv" == *,o=Debian,* ]] || return 1
+    case "$release_csv" in
+        *,c=main,*|*,c=contrib,*|*,c=non-free,*|*,c=non-free-firmware,*) ;;
         *) return 1 ;;
+    esac
+    case "$release_csv" in
+        *,n="$codename",*) expected_codename="$codename" ;;
+        *,n="${codename}-updates",*) expected_codename="${codename}-updates" ;;
+        *,n="${codename}-security",*) expected_codename="${codename}-security" ;;
+        *) return 1 ;;
+    esac
+    case "$expected_codename" in
+        "$codename")
+            case "$release_csv" in
+                *,a="$codename",*|*,a=stable,*|*,a=oldstable,*) ;;
+                *) return 1 ;;
+            esac
+            ;;
+        "${codename}-updates")
+            case "$release_csv" in
+                *,a="${codename}-updates",*|*,a=stable-updates,*|*,a=oldstable-updates,*) ;;
+                *) return 1 ;;
+            esac
+            ;;
+        "${codename}-security")
+            case "$release_csv" in
+                *,a="${codename}-security",*|*,a=stable-security,*|*,a=oldstable-security,*) ;;
+                *) return 1 ;;
+            esac
+            ;;
     esac
     return 0
 }
@@ -3883,7 +4109,6 @@ list_package_version_sources() {
 validate_official_candidate_source() {
     local package="$1"
     local version="$2"
-    local allow_ubuntu_esm_apps="${3:-0}"
     local record
     local allowed_record=""
     local rejected=0
@@ -3891,7 +4116,7 @@ validate_official_candidate_source() {
 
     mapfile -t records < <(list_package_version_sources "$package" "$version")
     for record in "${records[@]}"; do
-        if kernel_source_record_allowed "$record" "$allow_ubuntu_esm_apps"; then
+        if kernel_source_record_allowed "$record"; then
             [[ -n "$allowed_record" ]] || allowed_record="$record"
         else
             rejected=1
@@ -3920,7 +4145,7 @@ parse_candidate_kernel_image_dependencies() {
             sub(/^(Pre)?Depends:[[:space:]]+/, "", line)
             gsub(/[<>]/, "", line)
             sub(/:.*/, "", line)
-            if (line ~ /^linux-image-(unsigned-)?[0-9]/) print line
+            if (line ~ /^linux-image-[0-9]/) print line
         }
     '
 }
@@ -3943,7 +4168,6 @@ collect_candidate_kernel_images() {
 kernel_release_from_image_package() {
     local package="${1%%:*}"
 
-    package="${package#linux-image-unsigned-}"
     package="${package#linux-image-}"
     printf '%s\n' "$package"
 }
@@ -4434,17 +4658,15 @@ is_kernel_cleanup_meta_package() {
 
     is_kernel_meta_package_name "$package" && return 0
     case "$package" in
-        *-common|linux-tools-common|linux-cloud-tools-common)
+        *-common)
             return 1
             ;;
     esac
     case "$package" in
-        linux-headers-[0-9]*|linux-tools-[0-9]*|linux-cloud-tools-[0-9]*|\
-        linux-restricted-modules-[0-9]*|linux-modules-extra-[0-9]*)
+        linux-headers-[0-9]*)
             return 1
             ;;
-        linux-headers-*|linux-tools-*|linux-cloud-tools-*|linux-restricted-modules-*|\
-        linux-modules-extra-*)
+        linux-headers-*)
             return 0
             ;;
     esac
@@ -4536,8 +4758,7 @@ current_kernel_boot_artifacts_are_ready() {
         awk -F': ' 'NR==1 {print $1}')
     owner="${owner%%:*}"
     if [[ ! -s "/boot/vmlinuz-$current_kernel" ]] || \
-       [[ "$owner" != "linux-image-$current_kernel" && \
-          "$owner" != "linux-image-unsigned-$current_kernel" ]]; then
+       [[ "$owner" != "linux-image-$current_kernel" ]]; then
         error "当前运行内核的引导文件或软件包归属异常。"
         return 1
     fi
@@ -4575,12 +4796,7 @@ collect_old_kernel_candidates() {
 
     mapfile -t kernel_package_records < <(
         dpkg-query -W -f='${binary:Package}\t${db:Status-Abbrev}\n' \
-            'linux-image-[0-9]*' 'linux-image-unsigned-[0-9]*' \
-            'linux-image-extra-[0-9]*' \
-            'linux-headers-[0-9]*' 'linux-modules-[0-9]*' \
-            'linux-modules-extra-[0-9]*' 'linux-tools-[0-9]*' \
-            'linux-cloud-tools-[0-9]*' \
-            'linux-restricted-modules-[0-9]*' 2>/dev/null |
+            'linux-image-[0-9]*' 'linux-headers-[0-9]*' 2>/dev/null |
             parse_kernel_package_records
     )
     for record in "${kernel_package_records[@]}"; do
@@ -4594,7 +4810,7 @@ collect_old_kernel_candidates() {
     done
     for package in "${installed_kernel_packages[@]}"; do
         case "$package" in
-            linux-image-[0-9]*|linux-image-unsigned-[0-9]*)
+            linux-image-[0-9]*)
                 installed_releases+=("$(kernel_release_from_image_package "$package")")
                 ;;
         esac
@@ -4630,11 +4846,7 @@ collect_old_kernel_candidates() {
     for release in "${OLD_KERNEL_RELEASES[@]}"; do
         for package in "${installed_kernel_packages[@]}"; do
             case "$package" in
-                linux-image-"$release"|linux-image-unsigned-"$release"|\
-                 linux-image-extra-"$release"|\
-                 linux-modules-"$release"|linux-modules-extra-"$release"|\
-                 linux-headers-"$release"|linux-tools-"$release"|\
-                 linux-cloud-tools-"$release"|linux-restricted-modules-"$release")
+                linux-image-"$release"|linux-headers-"$release")
                     add_unique_path OLD_KERNEL_PACKAGES "$package"
                     ;;
             esac
@@ -4643,8 +4855,6 @@ collect_old_kernel_candidates() {
     for package in "${installed_kernel_packages[@]}"; do
         case "$package" in
             linux-headers-[0-9]*) related_stem="${package#linux-headers-}" ;;
-            linux-tools-[0-9]*) related_stem="${package#linux-tools-}" ;;
-            linux-cloud-tools-[0-9]*) related_stem="${package#linux-cloud-tools-}" ;;
             *) continue ;;
         esac
         related_stem="${related_stem%-common}"
@@ -5379,8 +5589,7 @@ validate_planned_kernel_images() {
 
     for package in "${UPDATE_UPGRADE_PACKAGES[@]}" "${UPDATE_NEW_PACKAGES[@]}"; do
         package="${package%%:*}"
-        if [[ "$package" == linux-image-[0-9]* || \
-              "$package" == linux-image-unsigned-[0-9]* ]]; then
+        if [[ "$package" == linux-image-[0-9]* ]]; then
             matched=0
             for candidate in "${CANDIDATE_KERNEL_IMAGES[@]}"; do
                 if [[ "$package" == "${candidate%%:*}" ]]; then
@@ -5471,7 +5680,7 @@ update_kernel_only() {
     current_owner=$(dpkg-query -S "/boot/vmlinuz-$current_kernel" 2>/dev/null |
         awk -F': ' 'NR==1 {print $1}')
     current_owner="${current_owner%%:*}"
-    if [[ "$current_owner" != linux-image-* && "$current_owner" != linux-image-unsigned-* ]]; then
+    if [[ "$current_owner" != linux-image-* ]]; then
         warn "当前运行内核不属于可识别的 linux-image 软件包；已停止自动更新。"
         return 1
     fi
@@ -5726,19 +5935,31 @@ submenu_ssh() {
                     pause_menu; continue
                 fi
 
-                if ! ensure_ssh_managed_include || ! write_sshd_key Port "$new_port"; then
+                if ! validate_sshd_syntax; then
+                    error "原 SSH 配置未通过语法检查：${SSH_CONFIG_FAILURE:-未知原因}"
+                    pause_menu; continue
+                fi
+                if ! ensure_ssh_managed_include; then
+                    rollback_ssh_with_message "SSH Include 配置写入失败"
+                    pause_menu; continue
+                fi
+                if ! write_sshd_key Port "$new_port"; then
                     rollback_ssh_with_message "SSH 托管配置写入失败"
                     pause_menu; continue
                 fi
 
                 configured_ports=$(get_configured_ssh_ports)
-                if ! sshd -t 2>/dev/null || [[ "$configured_ports" != "$new_port" ]]; then
-                    rollback_ssh_with_message "SSH 语法或生效配置验证失败"
+                if ! validate_sshd_syntax; then
+                    rollback_ssh_with_message "SSH 新配置未通过语法检查：${SSH_CONFIG_FAILURE:-未知原因}"
+                    pause_menu; continue
+                fi
+                if [[ "$configured_ports" != "$new_port" ]]; then
+                    rollback_ssh_with_message "SSH 最终有效端口验证失败（期望=$new_port；实际=${configured_ports:-未知}）"
                     pause_menu; continue
                 fi
 
                 if ! restart_ssh "$new_port"; then
-                    rollback_ssh_with_message "SSH 服务重启失败"
+                    rollback_ssh_with_message "SSH 服务重启或握手验证失败：${SSH_RESTART_FAILURE:-未知原因}"
                     pause_menu; continue
                 fi
 
@@ -5788,23 +6009,34 @@ submenu_ssh() {
                     pause_menu; continue
                 fi
 
-                if ! ensure_ssh_managed_include || \
-                   ! write_sshd_keys_atomic \
-                       PubkeyAuthentication yes \
-                       PasswordAuthentication no \
-                       KbdInteractiveAuthentication no \
-                       ChallengeResponseAuthentication no; then
+                if ! validate_sshd_syntax; then
+                    error "原 SSH 配置未通过语法检查：${SSH_CONFIG_FAILURE:-未知原因}"
+                    pause_menu; continue
+                fi
+                if ! ensure_ssh_managed_include; then
+                    rollback_ssh_with_message "SSH Include 配置写入失败"
+                    pause_menu; continue
+                fi
+                if ! write_sshd_keys_atomic \
+                    PubkeyAuthentication yes \
+                    PasswordAuthentication no \
+                    KbdInteractiveAuthentication no \
+                    ChallengeResponseAuthentication no; then
                     rollback_ssh_with_message "SSH 登录配置写入失败"
                     pause_menu; continue
                 fi
 
-                if ! sshd -t 2>/dev/null || ! root_key_only_login_is_safe; then
-                    rollback_ssh_with_message "SSH 登录配置验证失败"
+                if ! validate_sshd_syntax; then
+                    rollback_ssh_with_message "SSH 登录配置未通过语法检查：${SSH_CONFIG_FAILURE:-未知原因}"
+                    pause_menu; continue
+                fi
+                if ! root_key_only_login_is_safe; then
+                    rollback_ssh_with_message "SSH 最终有效登录配置验证失败"
                     pause_menu; continue
                 fi
 
                 if ! restart_ssh; then
-                    rollback_ssh_with_message "SSH 服务重启失败"
+                    rollback_ssh_with_message "SSH 服务重启或握手验证失败：${SSH_RESTART_FAILURE:-未知原因}"
                     pause_menu; continue
                 fi
 
@@ -5825,7 +6057,6 @@ submenu_ssh() {
 submenu_sec() {
     local command_output
     local command_status
-    local allow_ubuntu_esm_apps
 
     while true; do
         print_header "SSH 与安全"
@@ -5846,15 +6077,6 @@ submenu_sec() {
                     pause_menu; continue
                 fi
                 echo "将安装或更新 Fail2ban，并在现有 jail.local 中为 SSH 端口 $CURRENT_PORT 增量配置防爆破规则。"
-                allow_ubuntu_esm_apps=0
-                if [[ "$OS_ID" == "ubuntu" && "$OS_MAINTENANCE_CODE" == "esm" ]]; then
-                    if ! ubuntu_pro_esm_apps_is_active; then
-                        error "Ubuntu $OS_VERSION 的 Fail2ban 来自 Universe；当前无法确认 ESM Apps：${UBUNTU_PRO_ESM_STATUS_REASON:-状态未知}。"
-                        echo "请先使用 'pro status --all' 确认 esm-apps 为 enabled；脚本不会自动启用订阅服务。"
-                        pause_menu; continue
-                    fi
-                    allow_ubuntu_esm_apps=1
-                fi
                 confirm_action "确认继续配置 Fail2ban 吗？" || continue
                 export DEBIAN_FRONTEND=noninteractive
                 echo -e "${YELLOW}正在更新源并安装 Fail2ban，请稍候...${NC}"
@@ -5866,7 +6088,7 @@ submenu_sec() {
                     pause_menu; continue
                 fi
                 validate_official_package_install_plan \
-                    "Fail2ban" "$allow_ubuntu_esm_apps" fail2ban || { pause_menu; continue; }
+                    "Fail2ban" fail2ban || { pause_menu; continue; }
                 command_output=$(apt-get install --no-remove -y -- fail2ban 2>&1)
                 command_status=$?
                 if (( command_status != 0 )); then
@@ -5980,10 +6202,6 @@ dns_default_routes_share_interface() {
 
     [[ -z "$ipv4_interface" || -z "$ipv6_interface" || \
        "$ipv4_interface" == "$ipv6_interface" ]]
-}
-
-netplan_interface_name_is_safe() {
-    [[ "$1" =~ ^[A-Za-z0-9_-]{1,15}$ ]]
 }
 
 get_resolved_resolv_conf_mode() {
@@ -6200,15 +6418,6 @@ restore_dns_files() {
         fi
     done
 
-    if [[ "$DNS_NETPLAN_CONFIGURED" == "1" ]] && command -v netplan >/dev/null 2>&1; then
-        command_output=$(netplan generate 2>&1)
-        command_status=$?
-        if (( command_status != 0 )); then
-            detail "DNS" "ROLLBACK_NETPLAN" "恢复 YAML 后 netplan generate 失败，退出码=$command_status，输出=${command_output:-无}"
-            failed=1
-        fi
-    fi
-
     if [[ "$DNS_RESOLVED_ACTIVE" == "1" ]]; then
         command_output=$(timeout 30 systemctl restart systemd-resolved 2>&1)
         command_status=$?
@@ -6415,193 +6624,11 @@ sync_interfaces_dns() {
     return 0
 }
 
-netplan_dns_override_is_managed() {
-    local file="$1"
-
-    [[ -f "$file" && ! -L "$file" ]] || return 1
-    grep -Fxq -- "$NETPLAN_DNS_MANAGED_MARKER" "$file" && return 0
-
-    # Compatibility with the exact DNS-only file shape written by older vps-init versions.
-    awk '
-        /^[[:space:]]*$/ {next}
-        /^[[:space:]]*network:[[:space:]]*$/ {network=1; next}
-        /^[[:space:]]*version:[[:space:]]*2[[:space:]]*$/ {version=1; next}
-        /^[[:space:]]*ethernets:[[:space:]]*$/ {ethernets=1; next}
-        /^[[:space:]]*"[A-Za-z0-9_-]+"[[:space:]]*:[[:space:]]*$/ {interface=1; next}
-        /^[[:space:]]*nameservers:[[:space:]]*$/ {nameservers=1; next}
-        /^[[:space:]]*addresses:[[:space:]]*\[[^]]+\][[:space:]]*$/ {addresses=1; next}
-        /^[[:space:]]*dhcp[46]-overrides:[[:space:]]*$/ {next}
-        /^[[:space:]]*use-dns:[[:space:]]*false[[:space:]]*$/ {next}
-        {unsafe=1}
-        END {exit !(network && version && ethernets && interface && nameservers && addresses && !unsafe)}
-    ' "$file"
-}
-
-netplan_configuration_is_present() {
-    local config_dir
-    local config_file
-
-    for config_dir in /lib/netplan /etc/netplan /run/netplan; do
-        [[ -d "$config_dir" ]] || continue
-        config_file=$(find -P "$config_dir" -maxdepth 1 \
-            \( -type f -o -type l \) -name '*.yaml' -print -quit 2>/dev/null || true)
-        [[ -n "$config_file" ]] && return 0
-    done
-    return 1
-}
-
-netplan_get_is_supported() {
-    command -v netplan >/dev/null 2>&1 || return 1
-    if command -v timeout >/dev/null 2>&1; then
-        timeout 10 netplan get --help >/dev/null 2>&1
-    else
-        netplan get --help >/dev/null 2>&1
-    fi
-}
-
-netplan_default_interface_uses_networkmanager() {
-    local default_iface
-    local renderer=""
-
-    command -v netplan >/dev/null 2>&1 || return 1
-    netplan_configuration_is_present || return 1
-    netplan_get_is_supported || return 1
-    default_iface=$(get_default_network_interface)
-    if [[ -n "$default_iface" ]] && netplan_interface_name_is_safe "$default_iface"; then
-        renderer=$(netplan get "ethernets.${default_iface}.renderer" 2>/dev/null || true)
-    fi
-    renderer=$(tr -d '[:space:]"' <<< "$renderer" | tr '[:upper:]' '[:lower:]')
-    if [[ -z "$renderer" || "$renderer" == "null" ]]; then
-        renderer=$(netplan get renderer 2>/dev/null || true)
-        renderer=$(tr -d '[:space:]"' <<< "$renderer" | tr '[:upper:]' '[:lower:]')
-    fi
-    [[ "$renderer" == "networkmanager" ]]
-}
-
-sync_netplan_dns() {
-    local dns_line="$1"
-    local dns_csv="${dns_line// /, }"
-    local default_iface
-    local override_file="/etc/netplan/99-vps-init-dns.yaml"
-    local dhcp4
-    local dhcp6
-    local command_output
-    local command_status
-    local merged_dns
-    local effective_use_dns
-    local temp_file
-
-    netplan_configuration_is_present || return 0
-    if ! netplan_get_is_supported; then
-        error "检测到 Netplan 配置，但当前 netplan 不支持 get 子命令；无法安全验证合并后的网络配置。"
-        detail "DNS" "WRITE_NETPLAN" "netplan get 不可用；请先从当前系统官方仓库更新 netplan.io"
-        return 1
-    fi
-    if [[ -e /etc/netplan && ! -d /etc/netplan ]]; then
-        error "/etc/netplan 不是目录，已停止 DNS 配置。"
-        return 1
-    fi
-    if [[ ! -d /etc/netplan ]] && ! mkdir -m 755 -- /etc/netplan; then
-        error "无法创建 /etc/netplan，已停止 DNS 配置。"
-        return 1
-    fi
-    if [[ -L "$override_file" ]]; then
-        error "$override_file 是符号链接，为避免修改未知目标已停止 DNS 配置。"
-        return 1
-    fi
-    if [[ -e "$override_file" ]] && ! netplan_dns_override_is_managed "$override_file"; then
-        error "$override_file 已存在但不是可识别的 vps-init DNS 托管文件，未自动覆盖。"
-        return 1
-    fi
-
-    default_iface=$(get_default_network_interface)
-    if [[ -n "$default_iface" ]] && ! netplan_interface_name_is_safe "$default_iface"; then
-        error "默认网卡名称 $default_iface 无法安全映射到 Netplan 配置路径，未自动接管 DNS。"
-        detail "DNS" "WRITE_NETPLAN" "接口名不符合安全路径规则；接口=$default_iface"
-        return 1
-    fi
-    if [[ -z "$default_iface" ]] || ! netplan get "ethernets.${default_iface}" >/dev/null 2>&1; then
-        error "检测到 Netplan，但无法将默认网卡唯一映射到 ethernets 配置；未自动接管 DNS。"
-        detail "DNS" "WRITE_NETPLAN" "默认接口=${default_iface:-未检测到}；可能使用 match/set-name、bridge、bond、VLAN 或其他复杂拓扑"
-        return 1
-    fi
-
-    backup_dns_file "$override_file" || return 1
-    DNS_NETPLAN_CONFIGURED=1
-    dhcp4=$(netplan get "ethernets.${default_iface}.dhcp4" 2>/dev/null | tr '[:upper:]' '[:lower:]')
-    dhcp6=$(netplan get "ethernets.${default_iface}.dhcp6" 2>/dev/null | tr '[:upper:]' '[:lower:]')
-    temp_file=$(mktemp /etc/netplan/.vps-init-dns.XXXXXX) || return 1
-    if ! {
-        echo "$NETPLAN_DNS_MANAGED_MARKER"
-        echo "network:"
-        echo "  version: 2"
-        echo "  ethernets:"
-        printf '    "%s":\n' "$default_iface"
-        echo "      nameservers:"
-        echo "        addresses: [$dns_csv]"
-        if [[ "$dhcp4" == "true" ]]; then
-            echo "      dhcp4-overrides:"
-            echo "        use-dns: false"
-        fi
-        if [[ "$dhcp6" == "true" ]]; then
-            echo "      dhcp6-overrides:"
-            echo "        use-dns: false"
-        fi
-    } > "$temp_file" || \
-       ! chmod 600 "$temp_file" || \
-       ! chown root:root "$temp_file" || \
-       ! mv -f -- "$temp_file" "$override_file"; then
-        rm -f -- "$temp_file"
-        return 1
-    fi
-    command_output=$(netplan generate 2>&1)
-    command_status=$?
-    if (( command_status != 0 )); then
-        detail "DNS" "WRITE_NETPLAN" "netplan generate 失败，退出码=$command_status，输出=${command_output:-无}"
-        return 1
-    fi
-    command_output=$(netplan get "ethernets.${default_iface}.nameservers.addresses" 2>&1)
-    command_status=$?
-    if (( command_status != 0 )); then
-        detail "DNS" "WRITE_NETPLAN" "无法读取合并后的 DNS，退出码=$command_status，输出=${command_output:-无}"
-        return 1
-    fi
-    merged_dns=$(tr '[],"' '    ' <<< "$command_output")
-    if ! dns_text_uses_exact_servers "$merged_dns" "$dns_line"; then
-        detail "DNS" "WRITE_NETPLAN" "Netplan 列表合并后仍含旧 DNS；请求=$dns_line；合并结果=${command_output:-无}"
-        error "Netplan 现有 YAML 中还定义了其他静态 DNS；为避免跨文件列表追加，未自动覆盖原配置。"
-        return 1
-    fi
-    if [[ "$dhcp4" == "true" ]]; then
-        effective_use_dns=$(netplan get "ethernets.${default_iface}.dhcp4-overrides.use-dns" 2>/dev/null |
-            tr '[:upper:]' '[:lower:]')
-        [[ "$effective_use_dns" == "false" ]] || {
-            error "Netplan 合并后的 DHCPv4 use-dns 未关闭，持久化验证失败。"
-            return 1
-        }
-    fi
-    if [[ "$dhcp6" == "true" ]]; then
-        effective_use_dns=$(netplan get "ethernets.${default_iface}.dhcp6-overrides.use-dns" 2>/dev/null |
-            tr '[:upper:]' '[:lower:]')
-        [[ "$effective_use_dns" == "false" ]] || {
-            error "Netplan 合并后的 DHCPv6 use-dns 未关闭，持久化验证失败。"
-            return 1
-        }
-    fi
-    detail "DNS" "WRITE_NETPLAN" "接口=$default_iface；配置=$override_file；DHCPv4=$dhcp4；DHCPv6=$dhcp6；DNS=$dns_csv；仅执行 generate，未重载网卡"
-    log "已写入并验证 $default_iface 的 netplan DNS 持久化配置；本次不重载网卡。"
-}
-
 persist_dns_network_layer() {
     local dns_line="$1"
     local resolver_mode="${2:-inactive}"
 
-    if ! sync_netplan_dns "$dns_line"; then
-        detail "DNS" "WRITE_NETPLAN" "netplan 持久化配置写入或验证失败；请求=$dns_line"
-        return 1
-    fi
-    if [[ "$DNS_NETPLAN_CONFIGURED" == "0" ]] && \
-       ! sync_interfaces_dns "$dns_line" "$resolver_mode"; then
+    if ! sync_interfaces_dns "$dns_line" "$resolver_mode"; then
         detail "DNS" "WRITE_INTERFACES" "interfaces 持久化配置写入失败；请求=$dns_line"
         return 1
     fi
@@ -7239,19 +7266,9 @@ apply_dns_servers() {
         return 1
     fi
 
-    if netplan_configuration_is_present && ! netplan_get_is_supported; then
-        error "检测到 Netplan 配置，但当前版本缺少 get 子命令；无法可靠判断 renderer 与合并后的 DNS，未修改任何配置。"
-        detail "DNS" "PREFLIGHT" "netplan get 不可用；请先从当前系统官方仓库更新 netplan.io 后重试"
-        return 1
-    fi
-
     if systemctl is-active NetworkManager >/dev/null 2>&1; then
         error "NetworkManager 正在管理网络连接；为避免与连接级 DNS、路由域和 DHCP 设置冲突，未自动接管 DNS。"
         detail "DNS" "PREFLIGHT" "解析路径包含 NetworkManager；请使用 nmcli 修改默认连接的 ipv4.dns/ipv6.dns 与 ignore-auto-dns"
-        return 1
-    elif netplan_default_interface_uses_networkmanager; then
-        error "Netplan 的默认连接由 NetworkManager 渲染；为避免写入无法可靠接管的 DNS 配置，未自动修改。"
-        detail "DNS" "PREFLIGHT" "netplan renderer=NetworkManager；请使用 nmcli 修改连接级 DNS"
         return 1
     elif systemctl is-active systemd-resolved >/dev/null 2>&1; then
         if ! command -v resolvectl >/dev/null 2>&1; then
@@ -7308,7 +7325,6 @@ apply_dns_servers() {
     DNS_BACKUP_FILES=()
     DNS_FILE_EXISTED=()
     DNS_BACKUP_PATH="$BACKUP_DIR/dns-$(date +%Y%m%d%H%M%S)-$$"
-    DNS_NETPLAN_CONFIGURED=0
     DNS_INTERFACES_CONFIGURED=0
     DNS_INTERFACES_FILE=""
     DNS_INTERFACES_METHOD=""
@@ -7471,7 +7487,7 @@ apply_dns_servers() {
         return 1
     fi
 
-    detail "DNS" "VERIFY_SUCCESS" "DNS 已应用并通过路由、解析器状态和域名解析验证；netplan持久化=$DNS_NETPLAN_CONFIGURED；interfaces持久化=$DNS_INTERFACES_CONFIGURED；备份=$DNS_BACKUP_PATH"
+    detail "DNS" "VERIFY_SUCCESS" "DNS 已应用并通过路由、解析器状态和域名解析验证；interfaces持久化=$DNS_INTERFACES_CONFIGURED；备份=$DNS_BACKUP_PATH"
     return 0
 }
 
@@ -7550,9 +7566,6 @@ submenu_dns() {
         fi
 
         echo "将配置 DNS：$DNS_ENTRY"
-        if netplan_configuration_is_present; then
-            echo "netplan 仅写入并执行 generate 校验，不运行 apply，不会主动重载网卡。"
-        fi
         confirm_action "确认应用该 DNS 配置吗？" || continue
         log "正在配置 DNS..."
         if ! apply_dns_servers "$DNS_ENTRY"; then
@@ -7868,17 +7881,21 @@ configure_ipv6_state() {
     local module_disabled=""
     local runtime_path
     local runtime_value
+    local apply_failed=0
+    local failure_reason=""
+    local command_output=""
+    local command_status=0
 
     [[ "$target_value" == "0" ]] && action_label="启用"
     if [[ "$target_value" == "1" ]] && current_ssh_session_uses_ipv6; then
         error "当前 SSH 会话通过 IPv6 连接，禁用 IPv6 会立即中断会话；请改用 IPv4 登录或云厂商控制台执行。"
         return 1
     fi
-    if [[ "$target_value" == "1" ]] && \
-       ip -6 route show default 2>/dev/null | grep -q . && \
-       ! ipv4_route_is_available && ! current_ssh_session_uses_ipv4; then
-        error "检测到 IPv6 默认路由，但没有可用的 IPv4 路由或 IPv4 SSH 会话；禁用 IPv6 可能使服务器完全失联，已停止操作。"
-        return 1
+    if [[ "$target_value" == "1" ]] && ip -6 route show default 2>/dev/null | grep -q .; then
+        if ! ipv4_route_is_available && ! current_ssh_session_uses_ipv4; then
+            error "检测到 IPv6 默认路由，但没有可用的 IPv4 路由或 IPv4 SSH 会话；禁用 IPv6 可能使服务器完全失联，已停止操作。"
+            return 1
+        fi
     fi
     if [[ "$target_value" == "0" && -r /sys/module/ipv6/parameters/disable ]]; then
         module_disabled=$(tr '[:lower:]' '[:upper:]' < /sys/module/ipv6/parameters/disable 2>/dev/null)
@@ -7908,38 +7925,110 @@ configure_ipv6_state() {
         error "无法读取当前 IPv6 内核状态，未修改配置。"
         return 1
     fi
-    validate_effective_ipv6_interface_overrides "$target_value" || return 1
-    select_ipv6_sysctl_target || return 1
-    validate_sysctl_conf_final_pass_for_ipv6 "$target_value" || return 1
+    if ! validate_effective_ipv6_interface_overrides "$target_value"; then
+        return 1
+    fi
+    if ! select_ipv6_sysctl_target; then
+        return 1
+    fi
+    if ! validate_sysctl_conf_final_pass_for_ipv6 "$target_value"; then
+        return 1
+    fi
     detail "IPV6" "DETECT" "操作=$action_label；目标值=$target_value；原 all=$IPV6_PREVIOUS_ALL；原 default=$IPV6_PREVIOUS_DEFAULT；原 lo=$IPV6_PREVIOUS_LO；运行路径数=${#IPV6_RUNTIME_PATHS[@]}；配置=$IPV6_SYSCTL_FILE"
     if [[ -L "$IPV6_SYSCTL_FILE" ]] || \
        [[ -e "$IPV6_SYSCTL_FILE" && ! -f "$IPV6_SYSCTL_FILE" ]]; then
         error "$IPV6_SYSCTL_FILE 不是可安全替换的普通文件，已停止操作。"
         return 1
     fi
-    prepare_backup_path "$IPV6_BACKUP_PATH" || return 1
-    mkdir -p "$(dirname "$IPV6_SYSCTL_FILE")" || return 1
+    if ! prepare_backup_path "$IPV6_BACKUP_PATH"; then
+        return 1
+    fi
+    if ! mkdir -p "$(dirname "$IPV6_SYSCTL_FILE")"; then
+        error "无法创建 IPv6 sysctl 配置目录。"
+        return 1
+    fi
     if [[ -f "$IPV6_SYSCTL_FILE" ]]; then
         IPV6_FILE_EXISTED=1
-        cp -a "$IPV6_SYSCTL_FILE" "$IPV6_BACKUP_PATH/ipv6.conf" || return 1
+        if ! cp -a -- "$IPV6_SYSCTL_FILE" "$IPV6_BACKUP_PATH/ipv6.conf"; then
+            error "无法备份 IPv6 sysctl 配置。"
+            return 1
+        fi
     fi
 
     log "正在$action_label系统 IPv6 ..."
     if ! write_sysctl_keys_atomic "$IPV6_SYSCTL_FILE" \
-           net.ipv6.conf.all.disable_ipv6 "$target_value" \
-           net.ipv6.conf.default.disable_ipv6 "$target_value" \
-           net.ipv6.conf.lo.disable_ipv6 "$target_value" || \
-       [[ "$(get_effective_sysctl_value net.ipv6.conf.all.disable_ipv6)" != "$target_value" ]] || \
-       [[ "$(get_effective_sysctl_value net.ipv6.conf.default.disable_ipv6)" != "$target_value" ]] || \
-       [[ "$(get_effective_sysctl_value net.ipv6.conf.lo.disable_ipv6)" != "$target_value" ]] || \
-       ! ipv6_persistence_is_complete "$target_value" || \
-       ! sysctl -w "net.ipv6.conf.all.disable_ipv6=$target_value" >/dev/null 2>&1 || \
-       ! sysctl -w "net.ipv6.conf.default.disable_ipv6=$target_value" >/dev/null 2>&1 || \
-       ! sysctl -w "net.ipv6.conf.lo.disable_ipv6=$target_value" >/dev/null 2>&1 || \
-       [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" != "$target_value" ]] || \
-       [[ "$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null)" != "$target_value" ]] || \
-       [[ "$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null)" != "$target_value" ]] || \
-       ! verify_ipv6_runtime_state "$target_value"; then
+        net.ipv6.conf.all.disable_ipv6 "$target_value" \
+        net.ipv6.conf.default.disable_ipv6 "$target_value" \
+        net.ipv6.conf.lo.disable_ipv6 "$target_value"; then
+        apply_failed=1
+        failure_reason="sysctl 持久化文件写入失败"
+    fi
+    if [[ "$apply_failed" == "0" ]] && \
+       [[ "$(get_effective_sysctl_value net.ipv6.conf.all.disable_ipv6)" != "$target_value" ]]; then
+        apply_failed=1
+        failure_reason="持久化 all.disable_ipv6 最终值不匹配"
+    fi
+    if [[ "$apply_failed" == "0" ]] && \
+       [[ "$(get_effective_sysctl_value net.ipv6.conf.default.disable_ipv6)" != "$target_value" ]]; then
+        apply_failed=1
+        failure_reason="持久化 default.disable_ipv6 最终值不匹配"
+    fi
+    if [[ "$apply_failed" == "0" ]] && \
+       [[ "$(get_effective_sysctl_value net.ipv6.conf.lo.disable_ipv6)" != "$target_value" ]]; then
+        apply_failed=1
+        failure_reason="持久化 lo.disable_ipv6 最终值不匹配"
+    fi
+    if [[ "$apply_failed" == "0" ]] && ! ipv6_persistence_is_complete "$target_value"; then
+        apply_failed=1
+        failure_reason="IPv6 持久化加载顺序验证失败"
+    fi
+
+    if [[ "$apply_failed" == "0" ]]; then
+        command_output=$(sysctl -w "net.ipv6.conf.all.disable_ipv6=$target_value" 2>&1)
+        command_status=$?
+        if (( command_status != 0 )); then
+            apply_failed=1
+            failure_reason="all.disable_ipv6 应用失败；exit=$command_status；输出=${command_output:-无}"
+        fi
+    fi
+    if [[ "$apply_failed" == "0" ]]; then
+        command_output=$(sysctl -w "net.ipv6.conf.default.disable_ipv6=$target_value" 2>&1)
+        command_status=$?
+        if (( command_status != 0 )); then
+            apply_failed=1
+            failure_reason="default.disable_ipv6 应用失败；exit=$command_status；输出=${command_output:-无}"
+        fi
+    fi
+    if [[ "$apply_failed" == "0" ]]; then
+        command_output=$(sysctl -w "net.ipv6.conf.lo.disable_ipv6=$target_value" 2>&1)
+        command_status=$?
+        if (( command_status != 0 )); then
+            apply_failed=1
+            failure_reason="lo.disable_ipv6 应用失败；exit=$command_status；输出=${command_output:-无}"
+        fi
+    fi
+    if [[ "$apply_failed" == "0" ]] && \
+       [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" != "$target_value" ]]; then
+        apply_failed=1
+        failure_reason="all.disable_ipv6 运行值验证失败"
+    fi
+    if [[ "$apply_failed" == "0" ]] && \
+       [[ "$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null)" != "$target_value" ]]; then
+        apply_failed=1
+        failure_reason="default.disable_ipv6 运行值验证失败"
+    fi
+    if [[ "$apply_failed" == "0" ]] && \
+       [[ "$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null)" != "$target_value" ]]; then
+        apply_failed=1
+        failure_reason="lo.disable_ipv6 运行值验证失败"
+    fi
+    if [[ "$apply_failed" == "0" ]] && ! verify_ipv6_runtime_state "$target_value"; then
+        apply_failed=1
+        failure_reason="${IPV6_VERIFY_FAILURE:-IPv6 接口运行状态验证失败}"
+    fi
+
+    if [[ "$apply_failed" == "1" ]]; then
+        IPV6_VERIFY_FAILURE="$failure_reason"
         detail "IPV6" "VERIFY" "操作=$action_label；原因=${IPV6_VERIFY_FAILURE:-写入、持久化顺序或 sysctl 运行值验证失败}；持久化 all=$(get_effective_sysctl_value net.ipv6.conf.all.disable_ipv6)；持久化 default=$(get_effective_sysctl_value net.ipv6.conf.default.disable_ipv6)；持久化 lo=$(get_effective_sysctl_value net.ipv6.conf.lo.disable_ipv6)；运行 all=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || printf 未知)；运行 default=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || printf 未知)；运行 lo=$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null || printf 未知)"
         if restore_ipv6_transaction; then
             detail "IPV6" "ROLLBACK" "配置文件和运行参数恢复成功；备份=$IPV6_BACKUP_PATH"
@@ -8450,6 +8539,9 @@ main_menu() {
 # 启动执行
 # ==========================================
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    trap release_instance_lock EXIT
+    trap 'handle_termination_signal INT 130' INT
+    trap 'handle_termination_signal TERM 143' TERM
     check_os
     check_dependencies
     acquire_instance_lock

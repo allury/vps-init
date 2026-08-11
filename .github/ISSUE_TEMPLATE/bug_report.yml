@@ -10,7 +10,7 @@ body:
     id: os
     attributes:
       label: 操作系统
-      description: 例如 Debian 13 或 Ubuntu 24.04
+      description: 例如 Debian 12 Bookworm amd64 或 Debian 13 Trixie arm64
       placeholder: Debian 13
     validations:
       required: true
