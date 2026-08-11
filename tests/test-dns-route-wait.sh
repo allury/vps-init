@@ -144,4 +144,17 @@ declare -f apply_dns_servers | grep -Fq 'PREFLIGHT_TARGET_ROUTE' || \
 declare -f verify_dns_change | grep -Fq 'VERIFY_TARGET_ROUTE' || \
     fail_test "DNS verification does not recheck target routes"
 
+SYNC_INTERFACES_CALLS=0
+sync_interfaces_dns() {
+    SYNC_INTERFACES_CALLS=$((SYNC_INTERFACES_CALLS + 1))
+}
+persist_dns_network_layer '1.1.1.1' stub || \
+    fail_test "systemd-resolved ownership path was rejected"
+[[ "$SYNC_INTERFACES_CALLS" == "0" ]] || \
+    fail_test "systemd-resolved path also modified ifupdown"
+persist_dns_network_layer '1.1.1.1' static || \
+    fail_test "static resolver ownership path was rejected"
+[[ "$SYNC_INTERFACES_CALLS" == "1" ]] || \
+    fail_test "static resolver path did not persist through ifupdown detection"
+
 echo "DNS route wait tests passed."

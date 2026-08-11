@@ -23,6 +23,7 @@ FAIL_CONSUMED_FILE="$TEST_DIR/fail-consumed"
 SWAP_ACTIVE_FILE="$TEST_DIR/swap-active"
 FILESYSTEM_TYPE=ext4
 FAIL_STAGE=""
+BTRFS_MKSWAPFILE_AVAILABLE=1
 
 fail_test() {
     echo "SWAP transaction test failed: $1" >&2
@@ -67,7 +68,7 @@ dd() {
 btrfs() {
     if [[ "$1 $2" == "filesystem mkswapfile" ]]; then
         if [[ "${3:-}" == "--help" ]]; then
-            return 0
+            return "$((1 - BTRFS_MKSWAPFILE_AVAILABLE))"
         fi
         record_call BTRFS_MKSWAPFILE
         truncate -s 1048576 "${5}"
@@ -77,6 +78,23 @@ btrfs() {
         return 0
     fi
     return 1
+}
+
+chattr() {
+    record_call BTRFS_CHATTR
+    return 0
+}
+
+lsattr() {
+    printf '%s %s\n' '---------------C------' "$MANAGED_SWAP_FILE"
+}
+
+fallocate() {
+    local size="${2%M}"
+    local target="$3"
+
+    record_call BTRFS_FALLOCATE
+    truncate -s "$((size * 1024 * 1024))" "$target"
 }
 
 chmod() {
@@ -181,6 +199,7 @@ prepare_case() {
     : > "$LOG_FILE"
     FILESYSTEM_TYPE="$filesystem"
     FAIL_STAGE="$failure"
+    BTRFS_MKSWAPFILE_AVAILABLE=1
 }
 
 assert_success_path() {
@@ -225,6 +244,16 @@ assert_failure_rolls_back() {
 assert_success_path ext4
 assert_success_path xfs
 assert_success_path btrfs
+
+# Debian 12/13 normally provide btrfs mkswapfile. Keep the documented
+# NOCOW + fallocate fallback testable for minimal images with older tools.
+prepare_case btrfs
+BTRFS_MKSWAPFILE_AVAILABLE=0
+create_managed_swap 1M || fail_test "Btrfs fallback success path failed"
+grep -Fxq BTRFS_CHATTR "$CALL_LOG" || fail_test "Btrfs fallback did not set NOCOW"
+grep -Fxq BTRFS_FALLOCATE "$CALL_LOG" || fail_test "Btrfs fallback did not preallocate the file"
+grep -Fxq MKSWAP "$CALL_LOG" || fail_test "Btrfs fallback did not execute mkswap"
+grep -Fxq SWAPON "$CALL_LOG" || fail_test "Btrfs fallback did not execute swapon"
 
 # Regression guard: mkswap returning zero must continue to swapon and succeed.
 prepare_case ext4

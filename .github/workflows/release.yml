@@ -17,6 +17,7 @@ on:
         type: string
 
 permissions:
+  actions: read
   contents: write
 
 concurrency:
@@ -101,16 +102,23 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "notes_file=$notes_file" >> "$GITHUB_OUTPUT"
 
-      - name: Verify tagged source
+      - name: Verify tagged commit passed Debian quality matrix
         if: steps.release.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
 
-          bash -n vps.sh tests/*.sh
-          for test_file in tests/test-*.sh; do
-            echo "Running ${test_file}"
-            bash "${test_file}"
-          done
+          tag_commit=$(git rev-parse "refs/tags/${TAG}^{commit}")
+          successful_runs=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/quality.yml/runs?head_sha=${tag_commit}&status=success&per_page=100" \
+            --jq '[.workflow_runs[] | select(.event == "push" and .head_branch == "main" and .conclusion == "success")] | length')
+          if [[ "$successful_runs" -lt 1 ]]; then
+            echo "No successful Debian quality run found for tagged commit ${tag_commit}" >&2
+            exit 1
+          fi
 
       - name: Create or synchronize Release
         if: steps.release.outputs.skip != 'true'

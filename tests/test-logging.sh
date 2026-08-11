@@ -37,6 +37,19 @@ if grep -Fq 'top-secret' "$LOG_FILE" || grep -Fq 'user:pass' "$LOG_FILE"; then
     fail_test "diagnostic log retained a credential value"
 fi
 
+mock_failed_command() {
+    echo 'apt mock stderr token=command-secret' >&2
+    return 42
+}
+if run_command_with_diagnostic "APT" "MOCK_FAILURE" mock_failed_command >/dev/null; then
+    fail_test "diagnostic command runner inverted a nonzero exit status"
+fi
+grep -Fq '[DETAIL] [APT][MOCK_FAILURE] exit=42' "$LOG_FILE" || \
+    fail_test "diagnostic command runner did not preserve the command exit code"
+if grep -Fq 'command-secret' "$LOG_FILE"; then
+    fail_test "diagnostic command runner logged a secret"
+fi
+
 DNS_VERIFY_FAILURE=""
 if dns_verify_fail "VERIFY_SERVER" "requested server missing" "expected=1.1.1.1 actual=10.0.0.2"; then
     fail_test "dns_verify_fail should return a failure status"

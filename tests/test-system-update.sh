@@ -114,4 +114,29 @@ if kernel_source_record_allowed \
     fail_test "cross-version source metadata was accepted"
 fi
 
+SOURCE_VALIDATION_CALLS="$TEST_DIR/source-validation-calls"
+validate_official_candidate_source() {
+    printf '%s=%s\n' "$1" "$2" >> "$SOURCE_VALIDATION_CALLS"
+    [[ "$1" != "vendor-package" ]]
+}
+
+: > "$SOURCE_VALIDATION_CALLS"
+UPDATE_UPGRADE_PACKAGES=(ordinary-package)
+UPDATE_NEW_PACKAGES=()
+UPDATE_SIMULATION_OUTPUT='Inst ordinary-package [1.0] (1.1 Debian:13/stable [amd64])'
+validate_system_update_release_sources || \
+    fail_test "an ordinary Debian package was not source-validated"
+grep -Fxq 'ordinary-package=1.1' "$SOURCE_VALIDATION_CALLS" || \
+    fail_test "release validation was limited to core packages"
+
+: > "$SOURCE_VALIDATION_CALLS"
+UPDATE_UPGRADE_PACKAGES=(base-files vendor-package)
+UPDATE_NEW_PACKAGES=()
+UPDATE_SIMULATION_OUTPUT=$'Inst base-files [13.0] (13.1 Debian:13/stable [amd64])\nInst vendor-package [1.0] (2.0 Vendor:stable [amd64])'
+if validate_system_update_release_sources >/dev/null 2>&1; then
+    fail_test "a third-party package in the system update plan was accepted"
+fi
+grep -Fxq 'vendor-package=2.0' "$SOURCE_VALIDATION_CALLS" || \
+    fail_test "third-party package did not reach source validation"
+
 printf 'Debian system update tests passed.\n'
