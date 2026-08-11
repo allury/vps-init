@@ -24,10 +24,13 @@ SSHD_CONFIG_FILE="${VPS_INIT_SSHD_CONFIG_FILE:-/etc/ssh/sshd_config}"
 SSH_MANAGED_FILE="${VPS_INIT_SSH_MANAGED_FILE:-/etc/ssh/sshd_config.d/00-00-vps-init.conf}"
 GAI_MANAGED_BEGIN="# BEGIN vps-init IPv4 preference"
 GAI_MANAGED_END="# END vps-init IPv4 preference"
-VERSION="2.0.0"
+VERSION="2.0.1"
 MANAGED_SWAP_FILE="${VPS_INIT_SWAP_FILE:-/swapfile}"
 FSTAB_FILE="${VPS_INIT_FSTAB_FILE:-/etc/fstab}"
 BACKUP_DIR="/var/backups/vps-init"
+FAIL2BAN_JAIL_FILE="${VPS_INIT_FAIL2BAN_JAIL_FILE:-/etc/fail2ban/jail.local}"
+FAIL2BAN_JAIL_D_DIR="${VPS_INIT_FAIL2BAN_JAIL_D_DIR:-/etc/fail2ban/jail.d}"
+FAIL2BAN_AUTH_LOG_FILE="${VPS_INIT_FAIL2BAN_AUTH_LOG_FILE:-/var/log/auth.log}"
 declare -a DNS_RESOLVED_LINKS=()
 declare -A DNS_LINK_DNS_BEFORE=()
 declare -A DNS_LINK_DOMAINS_BEFORE=()
@@ -512,13 +515,144 @@ get_listening_ssh_ports() {
     fi
 }
 
+find_fail2ban_explicit_sshd_log_settings() {
+    local target_file="$1"
+    local file
+    local -a files=("$target_file" "$FAIL2BAN_JAIL_D_DIR"/*.local)
+
+    for file in "${files[@]}"; do
+        [[ "$file" != "$FAIL2BAN_JAIL_D_DIR/99-vps-init-port.local" ]] || continue
+        if [[ -L "$file" ]] || [[ -e "$file" && ! -f "$file" ]]; then
+            printf '%s:%s\n' "$file" "unsafe-file-type"
+            return 2
+        fi
+        [[ -f "$file" ]] || continue
+        awk -v source="$file" '
+            /^[[:space:]]*[#;]/ {next}
+            /^[[:space:]]*\[[^]]+\]/ {
+                section=$0
+                sub(/^[[:space:]]*\[/, "", section)
+                sub(/\].*$/, "", section)
+                in_sshd=(tolower(section) == "sshd")
+                next
+            }
+            in_sshd {
+                line=$0
+                sub(/^[[:space:]]*/, "", line)
+                key=line
+                sub(/[[:space:]]*[=:].*$/, "", key)
+                key=tolower(key)
+                if (key == "backend" || key == "logpath") {
+                    print source ":" key
+                }
+            }
+        ' "$file"
+    done
+}
+
+fail2ban_file_has_ssh_records() {
+    local file="$1"
+
+    [[ -f "$file" && ! -L "$file" && -r "$file" ]] || return 1
+    LC_ALL=C grep -Eq '(^|[[:space:]])sshd(\[[0-9]+\])?:' -- "$file" 2>/dev/null
+}
+
+fail2ban_journal_has_ssh_records() {
+    local journal_output=""
+    local journal_status=1
+
+    command -v journalctl >/dev/null 2>&1 || return 1
+    journal_output=$(timeout 5 journalctl --quiet --no-pager -n 1 _COMM=sshd 2>/dev/null)
+    journal_status=$?
+    if (( journal_status != 0 )); then
+        return 1
+    fi
+    [[ -n "$journal_output" ]]
+}
+
+fail2ban_systemd_backend_is_available() {
+    local backend_output=""
+    local backend_status=1
+
+    command -v python3 >/dev/null 2>&1 || return 1
+    backend_output=$(timeout 5 python3 -c 'from systemd import journal' 2>&1)
+    backend_status=$?
+    if (( backend_status != 0 )); then
+        detail "FAIL2BAN" "LOG_SOURCE" "systemd backend 依赖检查失败；exit=$backend_status；输出=${backend_output:-无}"
+        return 1
+    fi
+    return 0
+}
+
+detect_fail2ban_sshd_log_source() {
+    local target_file="$1"
+    local mode="$2"
+    local explicit_settings=""
+    local explicit_status=0
+    local file_available=0
+    local journal_available=0
+    local backend_available=0
+
+    FAIL2BAN_LOG_SOURCE_MODE="preserve"
+    FAIL2BAN_LOG_SOURCE_PATH=""
+    FAIL2BAN_LOG_SOURCE_FAILURE=""
+
+    if [[ "$mode" != "full" ]]; then
+        detail "FAIL2BAN" "LOG_SOURCE" "仅同步端口，不改变 backend/logpath"
+        return 0
+    fi
+
+    explicit_settings=$(find_fail2ban_explicit_sshd_log_settings "$target_file")
+    explicit_status=$?
+    if (( explicit_status != 0 )); then
+        FAIL2BAN_LOG_SOURCE_FAILURE="检测到无法安全读取的 Fail2ban 用户配置：${explicit_settings:-未知路径}"
+        return 1
+    fi
+    if [[ -n "$explicit_settings" ]]; then
+        FAIL2BAN_LOG_SOURCE_MODE="preserve"
+        detail "FAIL2BAN" "LOG_SOURCE" "保留用户已有 backend/logpath；来源=${explicit_settings//$'\n'/, }"
+        return 0
+    fi
+
+    if fail2ban_file_has_ssh_records "$FAIL2BAN_AUTH_LOG_FILE"; then
+        file_available=1
+    fi
+    if [[ "$file_available" == "1" ]]; then
+        detail "FAIL2BAN" "LOG_SOURCE" \
+            "文件日志=1；路径=$FAIL2BAN_AUTH_LOG_FILE；选择=file"
+        FAIL2BAN_LOG_SOURCE_MODE="file"
+        FAIL2BAN_LOG_SOURCE_PATH="$FAIL2BAN_AUTH_LOG_FILE"
+        return 0
+    fi
+    if fail2ban_journal_has_ssh_records; then
+        journal_available=1
+    fi
+    if fail2ban_systemd_backend_is_available; then
+        backend_available=1
+    fi
+
+    detail "FAIL2BAN" "LOG_SOURCE" \
+        "文件日志=$file_available；路径=$FAIL2BAN_AUTH_LOG_FILE；journal SSH 记录=$journal_available；systemd backend=$backend_available"
+
+    if [[ "$journal_available" == "1" && "$backend_available" == "1" ]]; then
+        FAIL2BAN_LOG_SOURCE_MODE="systemd"
+        return 0
+    fi
+
+    FAIL2BAN_LOG_SOURCE_FAILURE="无法确认 Fail2ban 可用的 SSH 日志来源，未修改配置"
+    return 1
+}
+
 render_fail2ban_sshd_section() {
     local source_file="$1"
     local output_file="$2"
     local port="$3"
     local mode="$4"
+    local log_source_mode="${5:-preserve}"
+    local log_source_path="${6:-}"
 
-    awk -v port="$port" -v mode="$mode" '
+    awk -v port="$port" -v mode="$mode" \
+        -v log_source_mode="$log_source_mode" -v log_source_path="$log_source_path" '
         function is_section(line, normalized) {
             normalized=tolower(line)
             return normalized ~ /^[[:space:]]*\[[^]]+\]/
@@ -534,6 +668,12 @@ render_fail2ban_sshd_section() {
                 print "maxretry = 5"
                 print "findtime = 3600"
                 print "bantime = 86400"
+                if (!has_backend && !has_logpath && log_source_mode == "systemd") {
+                    print "backend = systemd"
+                }
+                if (!has_backend && !has_logpath && log_source_mode == "file") {
+                    print "logpath = " log_source_path
+                }
             } else {
                 print "port = " port
             }
@@ -551,6 +691,8 @@ render_fail2ban_sshd_section() {
                 sub(/^[[:space:]]*/, "", key)
                 sub(/[[:space:]]*[=:].*$/, "", key)
                 key=tolower(key)
+                if (key == "backend") has_backend=1
+                if (key == "logpath") has_logpath=1
                 if (mode == "full" &&
                     (key == "enabled" || key == "port" || key == "maxretry" ||
                      key == "findtime" || key == "bantime")) next
@@ -611,10 +753,10 @@ fail2ban_file_has_after_include() {
 find_fail2ban_late_sshd_overrides() {
     local mode="$1"
     local file
-    local -a local_files=(/etc/fail2ban/jail.d/*.local)
+    local -a local_files=("$FAIL2BAN_JAIL_D_DIR"/*.local)
 
     for file in "${local_files[@]}"; do
-        [[ "$file" != "/etc/fail2ban/jail.d/99-vps-init-port.local" ]] || continue
+        [[ "$file" != "$FAIL2BAN_JAIL_D_DIR/99-vps-init-port.local" ]] || continue
         if [[ -L "$file" ]] || [[ -e "$file" && ! -f "$file" ]]; then
             printf '%s:%s\n' "$file" "unsafe-file-type"
             continue
@@ -900,6 +1042,8 @@ write_fail2ban_jail_atomic() {
     local port="$3"
     local mode="$4"
     local file_existed="$5"
+    local log_source_mode="${6:-preserve}"
+    local log_source_path="${7:-}"
     local temp_file
     local command_output
     local command_status
@@ -911,7 +1055,9 @@ write_fail2ban_jail_atomic() {
         return 1
     fi
 
-    if ! render_fail2ban_sshd_section "$source_file" "$temp_file" "$port" "$mode"; then
+    if ! render_fail2ban_sshd_section \
+        "$source_file" "$temp_file" "$port" "$mode" \
+        "$log_source_mode" "$log_source_path"; then
         rm -f -- "$temp_file"
         FAIL2BAN_WRITE_FAILURE="[sshd] 配置生成失败"
         return 1
@@ -955,9 +1101,9 @@ update_fail2ban_sshd_jail() {
     local port="$1"
     local mode="$2"
     local start_service="${3:-0}"
-    local target_file="/etc/fail2ban/jail.local"
+    local target_file="$FAIL2BAN_JAIL_FILE"
     local source_file
-    local legacy_file="/etc/fail2ban/jail.d/99-vps-init-port.local"
+    local legacy_file="$FAIL2BAN_JAIL_D_DIR/99-vps-init-port.local"
     local backup_path
     local backup_file
     local section_count=0
@@ -977,7 +1123,7 @@ update_fail2ban_sshd_jail() {
     backup_file="$backup_path/jail.local"
     legacy_backup="$backup_path/99-vps-init-port.local"
 
-    require_commands "Fail2ban 配置" awk mktemp timeout fail2ban-client systemctl || return 1
+    require_commands "Fail2ban 配置" awk grep mktemp timeout fail2ban-client systemctl || return 1
     if ! fail2ban_port_list_is_safe "$port"; then
         error "Fail2ban SSH 端口列表无效：$port"
         return 1
@@ -986,19 +1132,8 @@ update_fail2ban_sshd_jail() {
         error "$target_file 不是可安全替换的普通文件，已停止操作。"
         return 1
     fi
-    if ! prepare_backup_path "$backup_path"; then
-        return 1
-    fi
-    if ! mkdir -p "$(dirname "$target_file")"; then
-        error "无法创建 Fail2ban 配置目录。"
-        return 1
-    fi
     if [[ -f "$target_file" ]]; then
         file_existed=1
-        if ! cp -a -- "$target_file" "$backup_file"; then
-            error "无法备份 $target_file。"
-            return 1
-        fi
         section_count=$(awk 'tolower($0) ~ /^[[:space:]]*\[sshd\][[:space:]]*([#;].*)?$/ {count++} END {print count+0}' "$target_file")
         if (( section_count > 1 )); then
             error "$target_file 中存在多个 [sshd] 段，已停止自动修改。"
@@ -1009,21 +1144,12 @@ update_fail2ban_sshd_jail() {
             detail "FAIL2BAN" "PREFLIGHT" "检测到 jail.local 后置 include；配置=$target_file"
             return 1
         fi
-    else
-        if ! : > "$backup_file"; then
-            error "无法创建 jail.local 空状态备份。"
-            return 1
-        fi
     fi
     if [[ -L "$legacy_file" ]] || [[ -e "$legacy_file" && ! -f "$legacy_file" ]]; then
         error "$legacy_file 不是可安全迁移的普通文件。"
         return 1
     elif [[ -f "$legacy_file" ]]; then
         legacy_existed=1
-        if ! cp -a -- "$legacy_file" "$legacy_backup"; then
-            error "无法备份旧版 Fail2ban 端口配置。"
-            return 1
-        fi
     fi
 
     service_active=$(systemctl is-active fail2ban 2>/dev/null || true)
@@ -1036,12 +1162,44 @@ update_fail2ban_sshd_jail() {
        timeout 15 fail2ban-client status sshd >/dev/null 2>&1; then
         sshd_jail_active_before=1
     fi
+    if ! detect_fail2ban_sshd_log_source "$target_file" "$mode"; then
+        error "${FAIL2BAN_LOG_SOURCE_FAILURE:-无法确认 Fail2ban SSH 日志来源}。"
+        detail "FAIL2BAN" "PREFLIGHT" "日志来源检测失败；配置未修改"
+        return 1
+    fi
+
+    if ! prepare_backup_path "$backup_path"; then
+        return 1
+    fi
+    if ! mkdir -p "$(dirname "$target_file")"; then
+        error "无法创建 Fail2ban 配置目录。"
+        return 1
+    fi
+    if [[ "$file_existed" == "1" ]]; then
+        if ! cp -a -- "$target_file" "$backup_file"; then
+            error "无法备份 $target_file。"
+            return 1
+        fi
+    else
+        if ! : > "$backup_file"; then
+            error "无法创建 jail.local 空状态备份。"
+            return 1
+        fi
+    fi
+    if [[ "$legacy_existed" == "1" ]]; then
+        if ! cp -a -- "$legacy_file" "$legacy_backup"; then
+            error "无法备份旧版 Fail2ban 端口配置。"
+            return 1
+        fi
+    fi
+
     source_file="$target_file"
     if [[ "$file_existed" == "0" ]]; then
         source_file=/dev/null
     fi
     if ! write_fail2ban_jail_atomic \
-        "$source_file" "$target_file" "$port" "$mode" "$file_existed"; then
+        "$source_file" "$target_file" "$port" "$mode" "$file_existed" \
+        "$FAIL2BAN_LOG_SOURCE_MODE" "$FAIL2BAN_LOG_SOURCE_PATH"; then
         error "Fail2ban 配置写入失败：${FAIL2BAN_WRITE_FAILURE:-未知原因}。"
         return 1
     fi
@@ -4190,26 +4348,139 @@ get_filesystem_used_bytes() {
     local target="$1"
 
     df -B1 --output=used -- "$target" 2>/dev/null |
-        awk 'NR==2 {gsub(/[[:space:]]/, ""); print $1+0}'
+        awk '
+            NR == 2 && $1 ~ /^[0-9]+$/ {
+                print $1
+                found=1
+            }
+            END {exit(found ? 0 : 1)}
+        '
 }
 
-get_kernel_storage_used_bytes() {
-    local root_device=""
-    local boot_device=""
-    local root_used=0
-    local boot_used=0
+kernel_byte_count_is_safe() {
+    [[ "$1" =~ ^[0-9]{1,18}$ ]]
+}
 
-    root_used=$(get_filesystem_used_bytes /)
-    [[ "$root_used" =~ ^[0-9]+$ ]] || root_used=0
-    if [[ -d /boot ]]; then
-        root_device=$(stat -c '%d' / 2>/dev/null || true)
-        boot_device=$(stat -c '%d' /boot 2>/dev/null || true)
-        if [[ -n "$root_device" && -n "$boot_device" && "$root_device" != "$boot_device" ]]; then
-            boot_used=$(get_filesystem_used_bytes /boot)
-            [[ "$boot_used" =~ ^[0-9]+$ ]] || boot_used=0
+capture_kernel_storage_snapshot() {
+    local measured=""
+
+    KERNEL_STORAGE_ROOT_USED=""
+    KERNEL_STORAGE_BOOT_USED=""
+    KERNEL_STORAGE_ROOT_DEVICE=""
+    KERNEL_STORAGE_BOOT_DEVICE=""
+    KERNEL_STORAGE_RELATION="unknown"
+
+    if measured=$(get_filesystem_used_bytes /); then
+        if kernel_byte_count_is_safe "$measured"; then
+            KERNEL_STORAGE_ROOT_USED="$measured"
         fi
     fi
-    printf '%s\n' "$((root_used + boot_used))"
+
+    if measured=$(stat -c '%d' / 2>/dev/null); then
+        if [[ "$measured" =~ ^[0-9]+$ ]]; then
+            KERNEL_STORAGE_ROOT_DEVICE="$measured"
+        fi
+    fi
+
+    if [[ ! -d /boot ]]; then
+        KERNEL_STORAGE_RELATION="missing"
+        [[ -n "$KERNEL_STORAGE_ROOT_USED" ]]
+        return
+    fi
+
+    if measured=$(stat -c '%d' /boot 2>/dev/null); then
+        if [[ "$measured" =~ ^[0-9]+$ ]]; then
+            KERNEL_STORAGE_BOOT_DEVICE="$measured"
+        fi
+    fi
+
+    if [[ -z "$KERNEL_STORAGE_ROOT_DEVICE" || -z "$KERNEL_STORAGE_BOOT_DEVICE" ]]; then
+        KERNEL_STORAGE_RELATION="unknown"
+        [[ -n "$KERNEL_STORAGE_ROOT_USED" ]]
+        return
+    fi
+    if [[ "$KERNEL_STORAGE_ROOT_DEVICE" == "$KERNEL_STORAGE_BOOT_DEVICE" ]]; then
+        KERNEL_STORAGE_RELATION="same"
+        KERNEL_STORAGE_BOOT_USED="$KERNEL_STORAGE_ROOT_USED"
+        [[ -n "$KERNEL_STORAGE_ROOT_USED" ]]
+        return
+    fi
+
+    KERNEL_STORAGE_RELATION="separate"
+    if measured=$(get_filesystem_used_bytes /boot) && \
+       kernel_byte_count_is_safe "$measured"; then
+        KERNEL_STORAGE_BOOT_USED="$measured"
+    else
+        KERNEL_STORAGE_RELATION="separate-unavailable"
+    fi
+    [[ -n "$KERNEL_STORAGE_ROOT_USED" ]]
+}
+
+positive_byte_decrease() {
+    local before="$1"
+    local after="$2"
+    local before_value=0
+    local after_value=0
+
+    if ! kernel_byte_count_is_safe "$before"; then
+        printf '0\n'
+        return 1
+    fi
+    if ! kernel_byte_count_is_safe "$after"; then
+        printf '0\n'
+        return 1
+    fi
+
+    before_value=$((10#$before))
+    after_value=$((10#$after))
+    if (( before_value > after_value )); then
+        printf '%s\n' "$((before_value - after_value))"
+    else
+        printf '0\n'
+    fi
+}
+
+calculate_kernel_released_bytes() {
+    local root_before="$1"
+    local root_after="$2"
+    local boot_before="$3"
+    local boot_after="$4"
+    local relation_before="$5"
+    local relation_after="$6"
+    local root_device_before="$7"
+    local root_device_after="$8"
+    local boot_device_before="$9"
+    local boot_device_after="${10}"
+    local root_released=0
+    local boot_released=0
+
+    if [[ -n "$root_device_before" && -n "$root_device_after" && \
+          "$root_device_before" != "$root_device_after" ]]; then
+        root_released=0
+    else
+        if ! root_released=$(positive_byte_decrease "$root_before" "$root_after"); then
+            root_released=0
+        fi
+    fi
+
+    if [[ "$relation_before" == "separate" && "$relation_after" == "separate" && \
+          -n "$boot_device_before" && "$boot_device_before" == "$boot_device_after" ]]; then
+        if ! boot_released=$(positive_byte_decrease "$boot_before" "$boot_after"); then
+            boot_released=0
+        fi
+    fi
+
+    printf '%s\n' "$((root_released + boot_released))"
+}
+
+show_kernel_released_space() {
+    local released="$1"
+
+    if kernel_byte_count_is_safe "$released" && (( released > 0 )); then
+        echo -e "实际释放空间：${GREEN}$(format_bytes "$released")${NC}"
+    else
+        echo -e "实际释放空间：${YELLOW}未检测到可量化减少${NC}"
+    fi
 }
 
 show_released_space() {
@@ -5572,12 +5843,28 @@ verify_current_kernel_after_cleanup() {
 
 perform_old_kernel_removal() {
     local result_label="$1"
-    local before
-    local after
     local current_kernel
+    local root_before=""
+    local root_after=""
+    local boot_before=""
+    local boot_after=""
+    local relation_before="unknown"
+    local relation_after="unknown"
+    local root_device_before=""
+    local root_device_after=""
+    local boot_device_before=""
+    local boot_device_after=""
+    local released=0
 
     current_kernel=$(uname -r)
-    before=$(get_kernel_storage_used_bytes)
+    if ! capture_kernel_storage_snapshot; then
+        detail "KERNEL" "SPACE_BEFORE" "无法完整测量清理前文件系统使用量；继续执行已确认的内核删除计划"
+    fi
+    root_before="$KERNEL_STORAGE_ROOT_USED"
+    boot_before="$KERNEL_STORAGE_BOOT_USED"
+    relation_before="$KERNEL_STORAGE_RELATION"
+    root_device_before="$KERNEL_STORAGE_ROOT_DEVICE"
+    boot_device_before="$KERNEL_STORAGE_BOOT_DEVICE"
     if ! run_command_with_diagnostic "KERNEL" "PURGE" \
         apt-get purge -y -- "${OLD_KERNEL_PACKAGES[@]}"; then
         print_result "$result_label" "失败"
@@ -5602,8 +5889,22 @@ perform_old_kernel_removal() {
     fi
     print_result "$result_label" "已完成" \
         "${#OLD_KERNEL_RELEASES[@]} 个非运行版本，${#OLD_KERNEL_RESIDUAL_PACKAGES[@]} 个残留配置包"
-    after=$(get_kernel_storage_used_bytes)
-    show_released_space "$before" "$after"
+    if ! capture_kernel_storage_snapshot; then
+        detail "KERNEL" "SPACE_AFTER" "无法完整测量清理后文件系统使用量"
+    fi
+    root_after="$KERNEL_STORAGE_ROOT_USED"
+    boot_after="$KERNEL_STORAGE_BOOT_USED"
+    relation_after="$KERNEL_STORAGE_RELATION"
+    root_device_after="$KERNEL_STORAGE_ROOT_DEVICE"
+    boot_device_after="$KERNEL_STORAGE_BOOT_DEVICE"
+    released=$(calculate_kernel_released_bytes \
+        "$root_before" "$root_after" "$boot_before" "$boot_after" \
+        "$relation_before" "$relation_after" \
+        "$root_device_before" "$root_device_after" \
+        "$boot_device_before" "$boot_device_after")
+    detail "KERNEL" "SPACE" \
+        "root_before=${root_before:-不可用}；root_after=${root_after:-不可用}；boot_before=${boot_before:-不可用}；boot_after=${boot_after:-不可用}；relationship_before=$relation_before；relationship_after=$relation_after；root_device_before=${root_device_before:-不可用}；root_device_after=${root_device_after:-不可用}；boot_device_before=${boot_device_before:-不可用}；boot_device_after=${boot_device_after:-不可用}；released=$released"
+    show_kernel_released_space "$released"
 }
 
 cleanup_old_kernels() {
